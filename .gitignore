@@ -1,1 +1,7 @@
+# Ignore output and binary program files
 *.o
+proxy
+cache
+tiny/cgi-bin/adder
+tiny/cgi-bin/slow
+tiny/tiny
