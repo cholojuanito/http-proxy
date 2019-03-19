@@ -1,0 +1,8 @@
+# Ignore output and binary program files
+*.o
+proxy
+cache
+tiny/*
+.proxy/*
+.noproxy/*
+.vscode/*
