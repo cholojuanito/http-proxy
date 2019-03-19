@@ -51,7 +51,7 @@ static const char* connectionFailStr = "HTTP/1.0 400 \
 
 // Function declarations
 void usage();
-void proxyProcess(int* arg);
+void proxyThread(void* arg);
 int readRequest(char* str, int clientFd, char* host, char* port, char* cacheIdx, char* query);
 int forwardToServer(char* host, char* port, int* serverFd, char* requestStr);
 int forwardToClient(int clientFd, char* response, unsigned int len);
@@ -60,16 +60,18 @@ int readAndForwardToClient(int serverFd, int clientFd, char* cacheIdx, char* res
 int append(char* response, char* str, unsigned int addSize, unsigned int* prevSize);
 int parseRequest(char* buf, char* method, char* protocol, char* version, char* hostAndPort, char* query);
 void getHostAndPort(char* hostAndPort, char* host, char* port);
-void closeFd(int* clientFd, int* serverFd);
+void closeFds(int* clientFd, int* serverFd);
 // END function declarations
 
 
 int main(int argc, char** argv) {
     char* port;
-    int useCache = 0; // TODO: Change this to 1
+    //int useCache = 0; // TODO: Change this to 1
     struct sockaddr_in clientAddr;
-    int clientLength = sizeof(clientAddr);
+    socklen_t clientLength = sizeof(struct sockaddr_in);
+    pthread_t tid;
     int listenFd;
+    int* connFd;
 
     // Incorrect number of arguments
     if (argc < 2) {
@@ -77,10 +79,11 @@ int main(int argc, char** argv) {
     }
 
     // Decide if the cache should be used
-    if (argc >= 3) {
-        useCache = (strcmp(argv[2], CACHE_OFF));
-    }
+    // if (argc >= 3) {
+    //     useCache = (strcmp(argv[2], CACHE_OFF));
+    // }
 
+    // Make sure the port is valid    
     port = argv[1];
     int portNum = atoi(port);
     if (portNum <= MIN_PORT_NUMBER || portNum >= MAX_PORT_NUMBER) {
@@ -89,28 +92,24 @@ int main(int argc, char** argv) {
     }
 
     // Initialize cache
-    if (useCache) {
-        printf("Using cache\n");
-        // init cache
-    }
-    else {
-        printf("Not using cache\n");
-    }
+    // if (useCache) {
+    //     printf("Using cache\n");
+    //     // init cache
+    // }
+    // else {
+    //     printf("Not using cache\n");
+    // }
 
     // Ignore SIGPIPE
     Signal(SIGPIPE, SIG_IGN);
 
     listenFd = Open_listenfd(port);
     while (1) {
-        pthread_t tid;
-        int* connfd = Malloc(sizeof(int));
-        *connfd = -1;
-        *connfd = Accept(listenFd, (SA *) &clientAddr, (socklen_t *) &clientLength);
-        Pthread_create(&tid, NULL, (void *)proxyProcess, (void *) connfd);
+        connFd = Malloc(sizeof(int));
+        *connFd = Accept(listenFd, (SA *) &clientAddr, (socklen_t *) &clientLength);
+        Pthread_create(&tid, NULL, (void *) proxyThread, connFd);
 	}
 
-
-    printf("%s", userAgentHeadr);
     return 0;
 }
 
@@ -124,16 +123,16 @@ void usage(char *str) {
 	exit(1);
 }
 
-void proxyProcess(int* arg) {
-    printf("pid: %u\n", (unsigned int)Pthread_self());
+void proxyThread(void* arg) {
+    // printf("pid: %u\n", (unsigned int)Pthread_self());
     // Detach thread to avoid memory leaks
-	  Pthread_detach(Pthread_self());
+	Pthread_detach(Pthread_self());
 
-    int clientFd = (int)(*arg);
+    int clientFd = *((int*) arg);
+    Free(arg); // No memory leaks
 	int serverFd = -1;
     char buf[MAXBUF], requestStr[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF];
     char cacheIdx[MAXBUF], response[MAX_CACHE_SIZE];
-    unsigned int length;
 
     // Read the client request
     int readVal = readRequest(requestStr, clientFd, host, port, cacheIdx, query);
@@ -162,17 +161,16 @@ void proxyProcess(int* arg) {
             Rio_writen(clientFd, buf, strlen(dnsFailStr));
         }
         else {
-            //if (Rio_writen(server_fd, request_str, strlen(request_str)) == -1)
-            //	fprintf(stderr, "forward response to server error.\n");
-
-            int fVal = readAndForwardToClient(serverFd, clientFd, cacheIdx, response);
-            if (fVal == -1)
-                fprintf(stderr, "forward response to client error.\n");
-            else if (fVal == -2)
-                fprintf(stderr, "save response to cache error.\n");
+            int forwardVal = readAndForwardToClient(serverFd, clientFd, cacheIdx, response);
+            if (forwardVal == -1)
+                fprintf(stderr, "forward response to client error\n");
+            else if (forwardVal == -2)
+                fprintf(stderr, "save response to cache error\n");
         }
     }
 
+    closeFds(&clientFd, &serverFd);
+    return;
 }
 
 int readRequest(char* request, int clientFd, char* host, char* port, char* cacheIdx, char* query) {
@@ -433,7 +431,7 @@ int append(char* response, char* str, unsigned int addSize, unsigned int* prevSi
 	return 1;
 }
 
-void closeFd(int* clientFd, int* serverFd) {
+void closeFds(int* clientFd, int* serverFd) {
     if(clientFd && *clientFd >= 0) {
 		Close(*clientFd);
     }
