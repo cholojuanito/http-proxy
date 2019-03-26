@@ -6,10 +6,13 @@
 
 //#include "cache.h"
 #include "csapp.h"
+#include "sbuf.c"
 
 /* Recommended max cache and object contentLengths */
 #define MAX_CACHE_SIZE           1049000
 #define MAX_OBJECT_SIZE         102400
+#define NUM_THREADS          20
+#define QUEUE_SIZE           24
 #define MIN_PORT_NUMBER      1024
 #define MAX_PORT_NUMBER     65536
 #define CACHE_OFF              "off"
@@ -64,14 +67,16 @@ void closeFds(int* clientFd, int* serverFd);
 // END function declarations
 
 
+sbuf_t connQueue; // Global queue for connections
+
 int main(int argc, char** argv) {
     char* port;
     //int useCache = 0; // TODO: Change this to 1
     struct sockaddr_in clientAddr;
     socklen_t clientLength = sizeof(struct sockaddr_in);
-    pthread_t tid;
+    pthread_t tid[NUM_THREADS];
     int listenFd;
-    int* connFd;
+    int connFd;
 
     // Incorrect number of arguments
     if (argc < 2) {
@@ -104,11 +109,22 @@ int main(int argc, char** argv) {
     Signal(SIGPIPE, SIG_IGN);
 
     listenFd = Open_listenfd(port);
+    sbuf_init(&connQueue, QUEUE_SIZE);
+    // Spawn the threads
+    for (int i = 0; i < NUM_THREADS; i++) {
+        Pthread_create(&tid[i], NULL, (void *) proxyThread, NULL);
+    }
+
+    // Add new connections to the queue
     while (1) {
-        connFd = Malloc(sizeof(int));
-        *connFd = Accept(listenFd, (SA *) &clientAddr, (socklen_t *) &clientLength);
-        Pthread_create(&tid, NULL, (void *) proxyThread, connFd);
+        connFd = Accept(listenFd, (SA *) &clientAddr, (socklen_t *) &clientLength);
+        sbuf_insert(&connQueue, connFd);
 	}
+
+    // Reap threads
+    for (int i = 0; i < NUM_THREADS; i++) {
+        Pthread_join(tid[i], NULL);
+    }
 
     return 0;
 }
@@ -123,53 +139,53 @@ void usage(char *str) {
 	exit(1);
 }
 
-void proxyThread(void* arg) {
-    // printf("pid: %u\n", (unsigned int)Pthread_self());
-    // Detach thread to avoid memory leaks
-	Pthread_detach(Pthread_self());
+void proxyThread(void* arg) {    
+    printf("pid: %u\n", (unsigned int) pthread_self());
+    while (1) {
+        int clientFd = sbuf_remove(&connQueue); // Take care of the next connection
+        int serverFd = -1;
+        char buf[MAXBUF], requestStr[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF];
+        char cacheIdx[MAXBUF], response[MAX_CACHE_SIZE];
 
-    int clientFd = *((int*) arg);
-    Free(arg); // No memory leaks
-	int serverFd = -1;
-    char buf[MAXBUF], requestStr[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF];
-    char cacheIdx[MAXBUF], response[MAX_CACHE_SIZE];
+        // Read the client request
+        int readVal = readRequest(requestStr, clientFd, host, port, cacheIdx, query);
 
-    // Read the client request
-    int readVal = readRequest(requestStr, clientFd, host, port, cacheIdx, query);
+        printf("Read data from %s:%s\n",host,port);
+        fflush(stdout);
 
-    printf("Read data from %s:%s\n",host,port);
-	fflush(stdout);
+        if (!readVal) {
+            // if (!read_node_content()) {
 
-    if (!readVal) {
-        // if (!read_node_content()) {
+            // }
+            // else {
 
-        // }
-        // else {
+            // }
 
-        // }
-
-        // Forward request to remote sever
-        int bytesWritten = forwardToServer(host, port, &serverFd, requestStr);
-        if (bytesWritten == -1) {
-            fprintf(stderr, "forward response to server error.\n");
-            strcpy(buf, connectionFailStr);
-            Rio_writen(clientFd, buf, strlen(connectionFailStr));
+            // Forward request to remote sever
+            int bytesWritten = forwardToServer(host, port, &serverFd, requestStr);
+            if (bytesWritten == -1) {
+                fprintf(stderr, "forward response to server error.\n");
+                strcpy(buf, connectionFailStr);
+                Rio_writen(clientFd, buf, strlen(connectionFailStr));
+            }
+            else if (bytesWritten == -2) {
+                fprintf(stderr, "forward response to server error (dns look up fail).\n");
+                strcpy(buf, dnsFailStr);
+                Rio_writen(clientFd, buf, strlen(dnsFailStr));
+            }
+            else {
+                int forwardVal = readAndForwardToClient(serverFd, clientFd, cacheIdx, response);
+                if (forwardVal == -1)
+                    fprintf(stderr, "forward response to client error\n");
+                else if (forwardVal == -2)
+                    fprintf(stderr, "save response to cache error\n");
+            }
         }
-        else if (bytesWritten == -2) {
-            fprintf(stderr, "forward response to server error (dns look up fail).\n");
-            strcpy(buf, dnsFailStr);
-            Rio_writen(clientFd, buf, strlen(dnsFailStr));
-        }
-        else {
-            int forwardVal = readAndForwardToClient(serverFd, clientFd, cacheIdx, response);
-            if (forwardVal == -1)
-                fprintf(stderr, "forward response to client error\n");
-            else if (forwardVal == -2)
-                fprintf(stderr, "save response to cache error\n");
-        }
+
+        closeFds(&clientFd, &serverFd);
+
+        // Break out only on SIGINT
     }
-
-    closeFds(&clientFd, &serverFd);
     return;
 }
 
