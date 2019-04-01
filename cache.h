@@ -34,13 +34,13 @@ cacheList* initCache();
 void deleteCache(cacheList* list);
 void initNode(cacheNode* node);
 void setNode(cacheNode* node, char* index, unsigned int length);
-void addNode(cacheNode* node, cacheList* list);
+int addNode(cacheNode* node, cacheList* list);
 void deleteNode(cacheNode* node);
 
 cacheNode* findNode(cacheList* list, char* index);
 cacheNode* removeNode(char* index, cacheList* list);
 
-int readNodeContent(cacheList* list, char* index, char* content, unsigned int len);
+int readNodeContent(cacheList* list, char* index, char* content, unsigned int *len);
 int insertNodeContent(cacheList* list, char* index, char* content, unsigned int len);
 
 
