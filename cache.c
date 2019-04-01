@@ -41,7 +41,7 @@ void setNode(cacheNode* node, char* index, unsigned int length) {
     }
 }
 
-void addNode(cacheNode* node, cacheList* list) {
+int addNode(cacheNode* node, cacheList* list) {
     if (list) {
         pthread_rwlock_wrlock(list->lock);
         // Make sure there is room for the next object, if not then forget don't add it
@@ -57,6 +57,9 @@ void addNode(cacheNode* node, cacheList* list) {
             }
             
             list->bytesLeft -= node->length;
+        }
+        else {
+            return -1;
         }
         pthread_rwlock_unlock(list->lock);
     }
@@ -94,7 +97,7 @@ cacheNode* removeNode(char* index, cacheList* list) {
 }
 
 
-int readNodeContent(cacheList* list, char* index, char* content, unsigned int len) {
+int readNodeContent(cacheList* list, char* index, char* content, unsigned int *len) {
     if (!list) {
         return -1;
     }
@@ -108,8 +111,8 @@ int readNodeContent(cacheList* list, char* index, char* content, unsigned int le
         return -1;
     }
 
-    len = tmp->length;
-    memcpy(content, tmp->content, len);
+    *len = tmp->length;
+    memcpy(content, tmp->content, *len);
     pthread_rwlock_unlock(list->lock);
 
     return 0;
@@ -131,7 +134,9 @@ int insertNodeContent(cacheList* list, char* index, char* content, unsigned int 
 
     tmp->content = Malloc(sizeof(char) * len);
     memcpy(tmp->content, content, len);
-    addNode(tmp, list);
+    if (addNode(tmp, list) == - 1) {
+        return -2;
+    }
 
     return 0;
 }
