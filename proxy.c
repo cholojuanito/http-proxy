@@ -4,13 +4,13 @@
  */ 
 #include <stdio.h>
 
-//#include "cache.h"
+#include "cache.c"
 #include "csapp.h"
 #include "sbuf.c"
 
 /* Recommended max cache and object contentLengths */
-#define MAX_CACHE_SIZE           1049000
-#define MAX_OBJECT_SIZE         102400
+// #define MAX_CACHE_SIZE           1049000
+// #define MAX_OBJECT_SIZE         102400
 #define NUM_THREADS          20
 #define QUEUE_SIZE           24
 #define MIN_PORT_NUMBER      1024
@@ -55,10 +55,10 @@ static const char* connectionFailStr = "HTTP/1.0 400 \
 // Function declarations
 void usage();
 void proxyThread(void* arg);
-int readRequest(char* str, int clientFd, char* host, char* port, char* cacheIdx, char* query);
+int readRequest(char* str, int clientFd, char* host, char* port, char* cacheKey, char* query);
 int forwardToServer(char* host, char* port, int* serverFd, char* requestStr);
 int forwardToClient(int clientFd, char* response, unsigned int len);
-int readAndForwardToClient(int serverFd, int clientFd, char* cacheIdx, char* response);
+int readAndForwardToClient(int serverFd, int clientFd, char* cacheKey, char* response);
 
 int append(char* response, char* str, unsigned int addSize, unsigned int* prevSize);
 int parseRequest(char* buf, char* method, char* protocol, char* version, char* hostAndPort, char* query);
@@ -68,10 +68,11 @@ void closeFds(int* clientFd, int* serverFd);
 
 
 sbuf_t connQueue; // Global queue for connections
+cacheList* cache;
 
 int main(int argc, char** argv) {
     char* port;
-    //int useCache = 0; // TODO: Change this to 1
+    int useCache = 1;
     struct sockaddr_in clientAddr;
     socklen_t clientLength = sizeof(struct sockaddr_in);
     pthread_t tid[NUM_THREADS];
@@ -84,9 +85,9 @@ int main(int argc, char** argv) {
     }
 
     // Decide if the cache should be used
-    // if (argc >= 3) {
-    //     useCache = (strcmp(argv[2], CACHE_OFF));
-    // }
+    if (argc >= 3) {
+        useCache = (strcmp(argv[2], CACHE_OFF));
+    }
 
     // Make sure the port is valid    
     port = argv[1];
@@ -97,13 +98,14 @@ int main(int argc, char** argv) {
     }
 
     // Initialize cache
-    // if (useCache) {
-    //     printf("Using cache\n");
-    //     // init cache
-    // }
-    // else {
-    //     printf("Not using cache\n");
-    // }
+    cache = NULL;
+    if (useCache) {
+        printf("Using cache\n");
+        cache = initCache();
+    }
+    else {
+        printf("Not using cache\n");
+    }
 
     // Ignore SIGPIPE
     Signal(SIGPIPE, SIG_IGN);
@@ -131,8 +133,8 @@ int main(int argc, char** argv) {
 
 void usage(char *str) {
 	printf("\tusage: %s <port> [use cache]\n", str);
-  printf("\t\tport: the port this program will connect to\n");
-  printf("\t\tport: must be a number between 1025 and 65535\n");
+    printf("\t\tport: the port this program will connect to\n");
+    printf("\t\tport: must be a number between 1025 and 65535\n");
 	printf("\t\tcache: 'off' to turn off caching\n");
 	printf("\t\tcache: 'on' to turn on caching\n");
 	printf("\t\tcache is 'on' by default\n");
@@ -140,45 +142,49 @@ void usage(char *str) {
 }
 
 void proxyThread(void* arg) {    
-    printf("pid: %u\n", (unsigned int) pthread_self());
+    //printf("pid: %u\n", (unsigned int) pthread_self());
     while (1) {
         int clientFd = sbuf_remove(&connQueue); // Take care of the next connection
         int serverFd = -1;
         char buf[MAXBUF], requestStr[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF];
-        char cacheIdx[MAXBUF], response[MAX_CACHE_SIZE];
+        char cacheKey[MAXBUF], response[MAX_OBJECT_SIZE];
+        unsigned int length;
 
         // Read the client request
-        int readVal = readRequest(requestStr, clientFd, host, port, cacheIdx, query);
+        int readVal = readRequest(requestStr, clientFd, host, port, cacheKey, query);
 
-        printf("Read data from %s:%s\n",host,port);
+        //printf("Read data from %s:%s\n",host,port);
         fflush(stdout);
 
         if (!readVal) {
-            // if (!read_node_content()) {
-
-            // }
-            // else {
-
-            // }
-
-            // Forward request to remote sever
-            int bytesWritten = forwardToServer(host, port, &serverFd, requestStr);
-            if (bytesWritten == -1) {
-                fprintf(stderr, "forward response to server error.\n");
-                strcpy(buf, connectionFailStr);
-                Rio_writen(clientFd, buf, strlen(connectionFailStr));
-            }
-            else if (bytesWritten == -2) {
-                fprintf(stderr, "forward response to server error (dns look up fail).\n");
-                strcpy(buf, dnsFailStr);
-                Rio_writen(clientFd, buf, strlen(dnsFailStr));
+            if (readNodeContent(cache, cacheKey, response, &length) == 0) {
+                printf("Found in cache!\n");
+                int forwardVal = forwardToClient(clientFd, response, length);
+                if (forwardVal == -1) {
+                    fprintf(stderr, "Forward CACHE response to client error\n");
+                }
+                //Close(clientFd);
             }
             else {
-                int forwardVal = readAndForwardToClient(serverFd, clientFd, cacheIdx, response);
-                if (forwardVal == -1)
-                    fprintf(stderr, "forward response to client error\n");
-                else if (forwardVal == -2)
-                    fprintf(stderr, "save response to cache error\n");
+                // Forward request to remote sever
+                int bytesWritten = forwardToServer(host, port, &serverFd, requestStr);
+                if (bytesWritten == -1) {
+                    fprintf(stderr, "forward response to server error.\n");
+                    strcpy(buf, connectionFailStr);
+                    Rio_writen(clientFd, buf, strlen(connectionFailStr));
+                }
+                else if (bytesWritten == -2) {
+                    fprintf(stderr, "forward response to server error (dns look up fail).\n");
+                    strcpy(buf, dnsFailStr);
+                    Rio_writen(clientFd, buf, strlen(dnsFailStr));
+                }
+                else {
+                    int forwardVal = readAndForwardToClient(serverFd, clientFd, cacheKey, response);
+                    if (forwardVal == -1)
+                        fprintf(stderr, "forward response to client error\n");
+                    else if (forwardVal == -2)
+                        fprintf(stderr, "save response to cache error\n");
+                }
             }
         }
 
@@ -189,7 +195,7 @@ void proxyThread(void* arg) {
     return;
 }
 
-int readRequest(char* request, int clientFd, char* host, char* port, char* cacheIdx, char* query) {
+int readRequest(char* request, int clientFd, char* host, char* port, char* cacheKey, char* query) {
     char buf[MAXBUF], method[MAXBUF], protocol[MAXBUF], hostAndPort[MAXBUF], version[MAXBUF];
      rio_t rioClient;
 
@@ -251,12 +257,12 @@ int readRequest(char* request, int clientFd, char* host, char* port, char* cache
         }
 
         // Add caching information here
-        // strcpy(cacheIdx, host);
-        // strcat(cacheIdx, ":");
-        // strcat(cacheIdx, port);
-        // strcat(cacheIdx, query);
+        strcpy(cacheKey, host);
+        strcat(cacheKey, ":");
+        strcat(cacheKey, port);
+        strcat(cacheKey, query);
 
-        fprintf(stderr, "NEW REQUEST:\n %s", request);
+        //fprintf(stderr, "NEW REQUEST:\n %s", request);
         return 0;
     }
 
@@ -320,10 +326,10 @@ int forwardToClient(int clientFd, char* response, unsigned int len) {
 }
 
 
-int readAndForwardToClient(int serverFd, int clientFd, char* cacheIdx, char* response) {
+int readAndForwardToClient(int serverFd, int clientFd, char* cacheKey, char* response) {
     rio_t rioServer;
     char buf[MAXBUF];
-    unsigned int contentLength = 0, cacheSize =0;
+    unsigned int contentLength = 0, cacheSize = 0;
     int validReponseLength = 1;
 
     response[0] = END_STR;
@@ -410,10 +416,18 @@ int readAndForwardToClient(int serverFd, int clientFd, char* cacheIdx, char* res
 
     if (validReponseLength) {
         // Add to cache
-        // if (insert_content_node(cache_list, cache_index, response, cache_contentLength) == -1) {
-		// 	return -2;
-        // }
-		// printf("insert correct!\n");
+        int addToCacheVal = insertNodeContent(cache, cacheKey, response, cacheSize);
+        if (addToCacheVal == -1) {
+            printf("Cache error!\n");
+			return -2;
+        }
+        else if (addToCacheVal == -2) {
+            printf("Not enough space in cache!\n");
+            return -2;
+        }
+        else {
+            printf("Added response to cache!\n");
+        }
     }
 
     return 0;
@@ -438,7 +452,7 @@ void getHostAndPort(char* hostAndPort, char* host, char* port) {
 }
 
 int append(char* response, char* str, unsigned int addSize, unsigned int* prevSize) {
-    if(addSize + (*prevSize) > MAX_CACHE_SIZE) {
+    if(addSize + (*prevSize) > MAX_OBJECT_SIZE) {
         return 0;
     }
 
