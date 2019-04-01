@@ -5,7 +5,7 @@ cacheList* initCache() {
     list->head = list->tail = NULL;
     list->lock = Malloc(sizeof(*(list->lock)));
     pthread_rwlock_init((list->lock), NULL);
-    list->bytesLeft = MAX_CACHE_SIZE;
+    list->bytesLeft = 10000;
 
     return list;
 }
@@ -33,10 +33,10 @@ void initNode(cacheNode* node) {
 	}
 }
 
-void setNode(cacheNode* node, char* index, unsigned int length) {
+void setNode(cacheNode* node, char* key, unsigned int length) {
     if (node) {
-        node->index = Malloc(sizeof(char) * length);
-        memcpy(node->index, index, length);
+        node->key = Malloc(sizeof(char) * length);
+        memcpy(node->key, key, length);
         node->length = length;
     }
 }
@@ -45,7 +45,7 @@ int addNode(cacheNode* node, cacheList* list) {
     if (list) {
         pthread_rwlock_wrlock(list->lock);
         // Make sure there is room for the next object, if not then forget don't add it
-        if (node && (list->bytesLeft < node->length) && (node->length < MAX_OBJECT_SIZE)) {
+        if (node != NULL && (node->length < list->bytesLeft)) {
             
             if (!list->tail) {
                 list->head = list->tail = node;                
@@ -59,30 +59,32 @@ int addNode(cacheNode* node, cacheList* list) {
             list->bytesLeft -= node->length;
         }
         else {
+            pthread_rwlock_unlock(list->lock);
             return -1;
         }
         pthread_rwlock_unlock(list->lock);
     }
+    return 0;
 }
 
 void deleteNode(cacheNode* node) {
     if (node) {
         // Free the arrays inside the node first then free the node up
-        if (node->index) {
-            free(node->index);
+        if (node->key) {
+            free(node->key);
         }
-        if (node->content) {
-            free(node->content);
+        if (node->value) {
+            free(node->value);
         }
         free(node);
     }
 }
 
-cacheNode* findNode(cacheList* list, char* index) {
+cacheNode* findNode(cacheList* list, char* key) {
     if (list) {
         cacheNode* tmp = list->head;
         while (tmp) {
-            if (strcmp(tmp->index, index) == 0) {
+            if (strcmp(tmp->key, key) == 0) {
                 return tmp;
             }
 
@@ -92,19 +94,14 @@ cacheNode* findNode(cacheList* list, char* index) {
     return NULL;
 }
 
-cacheNode* removeNode(char* index, cacheList* list) {
-
-}
-
-
-int readNodeContent(cacheList* list, char* index, char* content, unsigned int *len) {
+int readNodeContent(cacheList* list, char* key, char* value, unsigned int *len) {
     if (!list) {
         return -1;
     }
 
     pthread_rwlock_rdlock(list->lock);
 
-    cacheNode* tmp = findNode(list, index);
+    cacheNode* tmp = findNode(list, key);
 
     if (!tmp) {
         pthread_rwlock_unlock(list->lock);
@@ -112,29 +109,30 @@ int readNodeContent(cacheList* list, char* index, char* content, unsigned int *l
     }
 
     *len = tmp->length;
-    memcpy(content, tmp->content, *len);
+    memcpy(value, tmp->value, *len);
     pthread_rwlock_unlock(list->lock);
 
     return 0;
 
 }
 
-int insertNodeContent(cacheList* list, char* index, char* content, unsigned int len) {
+int insertNodeContent(cacheList* list, char* key, char* value, unsigned int len) {
     if (!list) {
         return -1;
     }
 
     cacheNode* tmp = Malloc(sizeof(*tmp));
     initNode(tmp);
-    setNode(tmp, index, len);
+    setNode(tmp, key, len);
 
     if (!tmp) {
         return -1;
     }
 
-    tmp->content = Malloc(sizeof(char) * len);
-    memcpy(tmp->content, content, len);
-    if (addNode(tmp, list) == - 1) {
+    tmp->value = Malloc(sizeof(char) * len);
+    memcpy(tmp->value, value, len);
+    if (addNode(tmp, list) == -1) {
+        deleteNode(tmp);
         return -2;
     }
 

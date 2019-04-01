@@ -8,12 +8,12 @@
 #define MAX_OBJECT_SIZE 102400
 
 /*
-* A cacheNode is a response from a web server
-* that is connected with a particular request
+* A cacheNode is a response (value) from a web server
+* that is connected with a particular request (key)
 */
 typedef struct cacheNode {
-	char* index;
-	char* content;
+	char* key;
+	char* value;
 	struct cacheNode* prev;
 	struct cacheNode* next;
 	unsigned int length;
@@ -21,7 +21,6 @@ typedef struct cacheNode {
 
 /*
 * A cache is a linked list of cacheNodes
-* 
 */ 
 typedef struct cacheList {
 	cacheNode* head;
@@ -36,9 +35,7 @@ void initNode(cacheNode* node);
 void setNode(cacheNode* node, char* index, unsigned int length);
 int addNode(cacheNode* node, cacheList* list);
 void deleteNode(cacheNode* node);
-
 cacheNode* findNode(cacheList* list, char* index);
-cacheNode* removeNode(char* index, cacheList* list);
 
 int readNodeContent(cacheList* list, char* index, char* content, unsigned int *len);
 int insertNodeContent(cacheList* list, char* index, char* content, unsigned int len);
