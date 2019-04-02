@@ -5,7 +5,7 @@ cacheList* initCache() {
     list->head = list->tail = NULL;
     list->lock = Malloc(sizeof(*(list->lock)));
     pthread_rwlock_init((list->lock), NULL);
-    list->bytesLeft = 10000;
+    list->bytesLeft = MAX_CACHE_SIZE;
 
     return list;
 }

@@ -54,6 +54,7 @@ static const char* connectionFailStr = "HTTP/1.0 400 \
 
 // Function declarations
 void usage();
+void loggerThread(void* arg);
 void proxyThread(void* arg);
 int readRequest(char* str, int clientFd, char* host, char* port, char* cacheKey, char* query);
 int forwardToServer(char* host, char* port, int* serverFd, char* requestStr);
@@ -68,14 +69,16 @@ void closeFds(int* clientFd, int* serverFd);
 
 
 sbuf_t connQueue; // Global queue for connections
-cacheList* cache;
+sbuflog_t logQueue; // Global queue for logs
+cacheList* cache; // Here be the cache
+volatile sig_atomic_t exitRequested = 0; // SIGINT flag
 
 int main(int argc, char** argv) {
     char* port;
     int useCache = 1;
     struct sockaddr_in clientAddr;
     socklen_t clientLength = sizeof(struct sockaddr_in);
-    pthread_t tid[NUM_THREADS];
+    pthread_t tid[NUM_THREADS], tidLogger;
     int listenFd;
     int connFd;
 
@@ -110,11 +113,15 @@ int main(int argc, char** argv) {
     // Ignore SIGPIPE
     Signal(SIGPIPE, SIG_IGN);
 
+    // Spawn the logger thread
+    sbuflog_init(&logQueue, QUEUE_SIZE);
+    Pthread_create(&tidLogger, NULL, (void*)loggerThread, NULL);
+
     listenFd = Open_listenfd(port);
     sbuf_init(&connQueue, QUEUE_SIZE);
-    // Spawn the threads
+    // Spawn the client threads
     for (int i = 0; i < NUM_THREADS; i++) {
-        Pthread_create(&tid[i], NULL, (void *) proxyThread, NULL);
+        Pthread_create(&tid[i], NULL, (void*) proxyThread, NULL);
     }
 
     // Add new connections to the queue
@@ -141,9 +148,28 @@ void usage(char *str) {
 	exit(1);
 }
 
+void loggerThread(void* arg) {
+    FILE* logFile;
+    logFile = fopen("requests.txt", "a+");
+
+    if (logFile == NULL) {
+        fprintf(stderr, "error opening log file");
+        return;
+    }
+
+    while (exitRequested == 0) {
+        char* buf = sbuflog_remove(&logQueue);
+        if (fwrite(buf, 1, strlen(buf), logFile) <= 0) {
+            fprintf(stderr, "error writing to log file!\n");
+        }
+    }
+
+    fclose(logFile);
+}
+
 void proxyThread(void* arg) {    
     //printf("pid: %u\n", (unsigned int) pthread_self());
-    while (1) {
+    while (exitRequested == 0) {
         int clientFd = sbuf_remove(&connQueue); // Take care of the next connection
         int serverFd = -1;
         char buf[MAXBUF], requestStr[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF];
@@ -261,6 +287,14 @@ int readRequest(char* request, int clientFd, char* host, char* port, char* cache
         strcat(cacheKey, ":");
         strcat(cacheKey, port);
         strcat(cacheKey, query);
+
+        // Log it as well
+        char* logBuf = Malloc(sizeof(char) * strlen(cacheKey));
+        strcpy(logBuf, host);
+        strcat(logBuf, ":");
+        strcat(logBuf, port);
+        strcat(logBuf, query);
+        sbuflog_insert(&logQueue, logBuf);
 
         //fprintf(stderr, "NEW REQUEST:\n %s", request);
         return 0;
