@@ -49,10 +49,10 @@ def main():
             if not buf:
                 break
             content += buf
-        # set an alarm, so we can exit if it times out
+        # remove handler
         signal.signal(signal.SIGALRM, signal.SIG_IGN)
 
-        start_of_headers = content.index('\r\n\r\n')
+        start_of_headers = content.find('\r\n\r\n')
 
         if start_of_headers >= 0:
             fh.write(content[start_of_headers+4:])

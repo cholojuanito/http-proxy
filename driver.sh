@@ -16,8 +16,8 @@
 #   - Check maximum cache object size
 
 
-if [ -z "$6" ]; then
-	echo "Usage: $0 <mode> <basic_pts> <concurrency_pts> <log_pts> <cleanup_pts> <cache_pts>"
+if [ -z "$7" ]; then
+	echo "Usage: $0 <mode> <basic_pts> <concurrency_pts> <log_pts> <mem_mgmt_pts> <cleanup_pts> <cache_pts>"
 	exit
 fi
 
@@ -26,13 +26,14 @@ MODE=$1
 MAX_BASIC=$2
 MAX_CONCURRENCY=$3
 MAX_LOG=$4
-MAX_CLEANUP=$5
-MAX_CACHE=$6
+MAX_MEM_MGMT=$5
+MAX_CLEANUP=$6
+MAX_CACHE=$7
 
 if [ $MODE != "multiprocess" -a $MODE != "processpool" -a \
 	$MODE != "multithread" -a $MODE != "threadpool" -a \
 	$MODE != "epoll" ]; then
-	echo "Usage: $0 <mode> <basic_pts> <concurrency_pts> <log_pts> <cleanup_pts> <cache_pts>"
+	echo "Usage: $0 <mode> <basic_pts> <concurrency_pts> <log_pts> <mem_mgmt_pts> <cleanup_pts> <cache_pts>"
 	echo "mode should be one of: multiprocess, processpool, multithread, threadpool, epoll"
 	exit
 fi
@@ -91,7 +92,7 @@ function download_proxy {
     cd $1
     curl --max-time ${TIMEOUT} --silent --proxy $4 --output $2 $3
     (( $? == 28 )) && echo "Error: Fetch timed out after ${TIMEOUT} seconds"
-    cd $HOME_DIR
+    cd "$HOME_DIR"
 }
 
 #
@@ -100,9 +101,9 @@ function download_proxy {
 #
 function download_proxy_slow {
     cd $1
-    $HOME_DIR/slow-client.py $4 $3 1 ${TIMEOUT} $2
+    "$HOME_DIR"/slow-client.py $4 $3 1 ${TIMEOUT} $2
     (( $? == 1 )) && echo "Error: Fetch timed out after ${TIMEOUT} seconds"
-    cd $HOME_DIR
+    cd "$HOME_DIR"
 }
 
 #
@@ -113,7 +114,7 @@ function download_noproxy {
     cd $1
     curl --max-time ${TIMEOUT} --silent --output $2 $3 
     (( $? == 28 )) && echo "Error: Fetch timed out after ${TIMEOUT} seconds"
-    cd $HOME_DIR
+    cd "$HOME_DIR"
 }
 
 #
@@ -239,6 +240,26 @@ then
     exit
 fi
 
+# Make sure we have an existing executable slow-client.py file
+if [ ! -x ./slow-client.py ]
+then 
+    echo "Error: ./slow-client.py not found or not an executable file."
+    exit
+fi
+
+# At the moment, slow-client.py requires python2
+if ! python -V 2>&1 | grep -q "^Python 2"
+then 
+    echo "Error: ./slow-client.py requires python version 2."
+    exit
+fi
+
+# Check for valgrind
+if ! valgrind -h > /dev/null
+then 
+    exit
+fi
+
 # Create the test directories if needed
 if [ ! -d ${PROXY_DIR} ]
 then
@@ -283,6 +304,9 @@ proxy_pid=$!
 
 # Wait for the proxy to start in earnest
 wait_for_port_use "${proxy_port}"
+
+# Wait for threads to be initialized
+sleep 3
 
 num_threads_pre=`ps --no-headers -Lo lwp --pid $proxy_pid | sort -u | wc -l`
 num_processes_pre=`ps --no-headers -o pid --pid $proxy_pid --ppid $proxy_pid | sort -u | wc -l`
@@ -376,8 +400,9 @@ echo "logScore: $logScore/${MAX_LOG}"
 #
 
 echo ""
-echo "*** Cleanup ***"
+echo "*** Memory management and Cleanup ***"
 
+memmgmtScore=${MAX_MEM_MGMT}
 cleanupScore=${MAX_CLEANUP}
 def_lost=`grep 'definitely lost:' $VALGRIND_LOG | awk '{ print $4 }'`
 indir_lost=`grep 'indirectly lost:' $VALGRIND_LOG | awk '{ print $4 }'`
@@ -390,14 +415,15 @@ if [ \( -n "$def_lost" -a "$def_lost" != "0" \) -o \
 	\( -n "$indir_lost" -a "$indir_lost" != "0" \) -o \
 	\( -n "$poss_lost" -a "$poss_lost" != "0" \) ]; then
         echo "   Bytes lost, either definitely, indirectly, or possibly"
-	cleanupScore=`expr ${cleanupScore} - "(" ${MAX_CLEANUP} / 2 ")"`
+	memmgmtScore=`expr ${memmgmtScore} - ${MAX_MEM_MGMT}`
 fi
 
 if [ -n "$still_reach" -a "$still_reach" != "0" ]; then
         echo "   Bytes still reachable"
-	cleanupScore=`expr ${cleanupScore} - "(" ${MAX_CLEANUP} / 2 ")"`
+	cleanupScore=`expr ${cleanupScore} - ${MAX_CLEANUP}`
 fi
 
+echo "memmgmtScore: $memmgmtScore/${MAX_MEM_MGMT}"
 echo "cleanupScore: $cleanupScore/${MAX_CLEANUP}"
 
 ######

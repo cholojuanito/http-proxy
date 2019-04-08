@@ -6,3 +6,5 @@ tiny/*
 .proxy/*
 .noproxy/*
 .vscode/*
+requests.txt
+requests.log
