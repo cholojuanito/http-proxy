@@ -149,22 +149,22 @@ void usage(char *str) {
 }
 
 void loggerThread(void* arg) {
-    FILE* logFile;
-    logFile = fopen("requests.txt", "a+");
-
-    if (logFile == NULL) {
-        fprintf(stderr, "error opening log file");
-        return;
-    }
 
     while (exitRequested == 0) {
+        FILE* logFile = fopen("requests.txt", "a+");
+
+        if (logFile == NULL) {
+            fprintf(stderr, "error opening log file");
+            continue;
+        }
+
         char* buf = sbuflog_remove(&logQueue);
-        if (fwrite(buf, 1, strlen(buf), logFile) <= 0) {
+        if (fwrite(buf, strlen(buf), 1, logFile) <= 0) {
             fprintf(stderr, "error writing to log file!\n");
         }
-    }
 
-    fclose(logFile);
+        fclose(logFile);
+    }
 }
 
 void proxyThread(void* arg) {    
@@ -289,11 +289,14 @@ int readRequest(char* request, int clientFd, char* host, char* port, char* cache
         strcat(cacheKey, query);
 
         // Log it as well
-        char* logBuf = Malloc(sizeof(char) * strlen(cacheKey));
-        strcpy(logBuf, host);
+        char* httpPrefix = "http://";
+        char* logBuf = Malloc(sizeof(char) * (strlen(cacheKey) + strlen(httpPrefix) + strlen("\n")));
+        strcpy(logBuf, httpPrefix);
+        strcat(logBuf, host);
         strcat(logBuf, ":");
         strcat(logBuf, port);
         strcat(logBuf, query);
+        strcat(logBuf, "\n");
         sbuflog_insert(&logQueue, logBuf);
 
         //fprintf(stderr, "NEW REQUEST:\n %s", request);
