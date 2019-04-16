@@ -2,19 +2,28 @@
  * Tanner Davis - BYU CS 324 Winter 2019
  * 
  */ 
+#include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <string.h>
+#include <netinet/in.h>
 
 #include "cache.c"
-#include "csapp.h"
 #include "sbuf.c"
 
 /* Recommended max cache and object contentLengths */
-// #define MAX_CACHE_SIZE           1049000
-// #define MAX_OBJECT_SIZE         102400
-#define NUM_THREADS          20
+#define MAX_CACHE_SIZE       1049000
+#define MAX_OBJECT_SIZE      102400
+#define MAXBUF               8192
+#define MAX_EVENTS          25
 #define QUEUE_SIZE           24
 #define MIN_PORT_NUMBER      1024
 #define MAX_PORT_NUMBER     65536
+#define TIMEOUT             1
 #define CACHE_OFF              "off"
 #define FORWARD_SLASH          "/"
 #define HTTP_DELIM             "://"
@@ -54,7 +63,12 @@ static const char* connectionFailStr = "HTTP/1.0 400 \
 
 // Function declarations
 void usage();
-void loggerThread(void* arg);
+int openListenfd(char *port);
+
+int handleClient(int connfd);
+int handleNewClient(int listenfd);
+
+void logInfo(char* buf);
 void proxyThread(void* arg);
 int readRequest(char* str, int clientFd, char* host, char* port, char* cacheKey, char* query);
 int forwardToServer(char* host, char* port, int* serverFd, char* requestStr);
@@ -67,20 +81,26 @@ void getHostAndPort(char* hostAndPort, char* host, char* port);
 void closeFds(int* clientFd, int* serverFd);
 // END function declarations
 
+// Struct for callback functions and their arguments
+struct event_action {
+	int (*callback)(int);
+	void *arg;
+};
+int efd; // epoll file descriptor
 
-sbuf_t connQueue; // Global queue for connections
-sbuflog_t logQueue; // Global queue for logs
 cacheList* cache; // Here be the cache
 volatile sig_atomic_t exitRequested = 0; // SIGINT flag
 
 int main(int argc, char** argv) {
     char* port;
     int useCache = 1;
-    struct sockaddr_in clientAddr;
-    socklen_t clientLength = sizeof(struct sockaddr_in);
-    pthread_t tid[NUM_THREADS], tidLogger;
+    struct epoll_event event;
+	struct epoll_event *events;
+    struct event_action *ea;
+    int *argptr; // Argument for the callback
     int listenFd;
-    int connFd;
+    int i; // For iterating the events when one occurs
+    size_t n; // Number of events while waiting
 
     // Incorrect number of arguments
     if (argc < 2) {
@@ -111,30 +131,68 @@ int main(int argc, char** argv) {
     }
 
     // Ignore SIGPIPE
-    Signal(SIGPIPE, SIG_IGN);
+    //Signal(SIGPIPE, SIG_IGN);
 
-    // Spawn the logger thread
-    sbuflog_init(&logQueue, QUEUE_SIZE);
-    Pthread_create(&tidLogger, NULL, (void*)loggerThread, NULL);
 
-    listenFd = Open_listenfd(port);
-    sbuf_init(&connQueue, QUEUE_SIZE);
-    // Spawn the client threads
-    for (int i = 0; i < NUM_THREADS; i++) {
-        Pthread_create(&tid[i], NULL, (void*) proxyThread, NULL);
+    listenFd = openListenfd(port);
+    // Set listenFd to be non-blocking
+    if (fcntl(listenFd, F_SETFL, fcntl(listenFd, F_GETFL) | O_NONBLOCK)) {
+        fprintf(stderr, "error setting listening socket\n");
+		exit(1);
     }
 
-    // Add new connections to the queue
-    while (1) {
-        connFd = Accept(listenFd, (SA *) &clientAddr, (socklen_t *) &clientLength);
-        sbuf_insert(&connQueue, connFd);
+    // Create an epoll file descriptor
+    if ((efd = epoll_create1(0)) < 0) {
+		fprintf(stderr, "error creating epoll fd\n");
+		exit(1);
 	}
 
-    // Reap threads
-    for (int i = 0; i < NUM_THREADS; i++) {
-        Pthread_join(tid[i], NULL);
-    }
+    ea = malloc(sizeof(struct event_action));
+    ea->callback = handleNewClient;
+    argptr = malloc(sizeof(int));
+    *argptr = listenFd;
 
+    ea->arg = argptr;
+    event.data.ptr = ea;
+    event.events = EPOLLIN | EPOLLET; // edge-triggered monitoring
+    if (epoll_ctl(efd, EPOLL_CTL_ADD, listenFd, &event) < 0) {
+		fprintf(stderr, "error adding event\n");
+		exit(1);
+	}
+
+    // Buffer where events are returned
+	events = calloc(MAX_EVENTS, sizeof(event));
+
+    // Wait for events to happen
+    while (1) {        
+		n = epoll_wait(efd, events, MAX_EVENTS, -1);
+        // Iterate through the events and handle them
+		for (i = 0; i < n; i++) {
+            // Get the callback function and argument for the event
+			ea = (struct event_action *)events[i].data.ptr;
+			argptr = ea->arg;
+
+            // Check for errors
+			if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+				/* An error has occured on this fd */
+				fprintf (stderr, "epoll error on fd %d\n", *argptr);
+				close(*argptr);
+				free(ea->arg);
+				free(ea);
+				continue;
+			}
+
+            // Call the callback function
+			if (!ea->callback(*argptr)) {
+				close(*argptr);
+				free(ea->arg);
+				free(ea);
+			}
+
+		}
+	}
+
+    
     return 0;
 }
 
@@ -148,29 +206,90 @@ void usage(char *str) {
 	exit(1);
 }
 
-void loggerThread(void* arg) {
+void logInfo(char* buf) {
 
-    while (exitRequested == 0) {
-        FILE* logFile = fopen("requests.txt", "a+");
+    FILE* logFile = fopen("requests.txt", "a+");
 
-        if (logFile == NULL) {
-            fprintf(stderr, "error opening log file");
-            continue;
-        }
-
-        char* buf = sbuflog_remove(&logQueue);
-        if (fwrite(buf, strlen(buf), 1, logFile) <= 0) {
-            fprintf(stderr, "error writing to log file!\n");
-        }
-
-        fclose(logFile);
+    if (logFile == NULL) {
+        fprintf(stderr, "error opening log file");
     }
+
+    if (fwrite(buf, strlen(buf), 1, logFile) <= 0) {
+        fprintf(stderr, "error writing to log file!\n");
+    }
+
+    fclose(logFile);
 }
+
+int handleNewClient(int listenfd) {
+	socklen_t clientlen;
+	int connfd;
+	struct sockaddr_storage clientaddr;
+	struct epoll_event event;
+	int* argptr;
+	struct event_action* ea;
+
+	clientlen = sizeof(struct sockaddr_storage); 
+
+	// loop and get all the connections that are available
+	while ((connfd = accept(listenfd, (struct sockaddr*)&clientaddr, &clientlen)) > 0) {
+
+		// set fd to non-blocking (set flags while keeping existing flags)
+		if (fcntl(connfd, F_SETFL, fcntl(connfd, F_GETFL, 0) | O_NONBLOCK) < 0) {
+			fprintf(stderr, "error setting socket option\n");
+			exit(1);
+		}
+
+		ea = malloc(sizeof(struct event_action));
+		ea->callback = handleClient;
+		argptr = malloc(sizeof(int));
+		*argptr = connfd;
+
+		// add event to epoll file descriptor
+		ea->arg = argptr;
+		event.data.ptr = ea;
+		event.events = EPOLLIN | EPOLLET; // use edge-triggered monitoring
+		if (epoll_ctl(efd, EPOLL_CTL_ADD, connfd, &event) < 0) {
+			fprintf(stderr, "error adding event\n");
+			exit(1);
+		}
+	}
+
+	if (errno == EWOULDBLOCK || errno == EAGAIN) {
+		// no more clients to accept()
+		return 1;
+	} else {
+		perror("error accepting");
+		return 0;
+	}
+}
+
+int handleClient(int connfd) {
+	int len;
+	char buf[MAXLINE]; 
+	while ((len = recv(connfd, buf, MAXLINE, 0)) > 0) {
+		printf("Received %d bytes\n", len);
+		send(connfd, buf, len, 0);
+	}
+	if (len == 0) {
+		// EOF received.
+		// Closing the fd will automatically unregister the fd
+		// from the efd
+		return 0;
+	} else if (errno == EWOULDBLOCK || errno == EAGAIN) {
+		return 1;
+		// no more data to read()
+	} else {
+		perror("error reading");
+		return 0;
+	}
+}
+
 
 void proxyThread(void* arg) {    
     //printf("pid: %u\n", (unsigned int) pthread_self());
     while (exitRequested == 0) {
-        int clientFd = sbuf_remove(&connQueue); // Take care of the next connection
+        int clientFd = 1;
         int serverFd = -1;
         char buf[MAXBUF], requestStr[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF];
         char cacheKey[MAXBUF], response[MAX_OBJECT_SIZE];
@@ -220,6 +339,7 @@ void proxyThread(void* arg) {
     }
     return;
 }
+
 
 int readRequest(char* request, int clientFd, char* host, char* port, char* cacheKey, char* query) {
     char buf[MAXBUF], method[MAXBUF], protocol[MAXBUF], hostAndPort[MAXBUF], version[MAXBUF];
@@ -288,7 +408,7 @@ int readRequest(char* request, int clientFd, char* host, char* port, char* cache
         strcat(cacheKey, port);
         strcat(cacheKey, query);
 
-        // Log it as well
+        // TODO Log it as well
         char* httpPrefix = "http://";
         char* logBuf = Malloc(sizeof(char) * (strlen(cacheKey) + strlen(httpPrefix) + strlen("\n")));
         strcpy(logBuf, httpPrefix);
@@ -297,7 +417,6 @@ int readRequest(char* request, int clientFd, char* host, char* port, char* cache
         strcat(logBuf, port);
         strcat(logBuf, query);
         strcat(logBuf, "\n");
-        sbuflog_insert(&logQueue, logBuf);
 
         //fprintf(stderr, "NEW REQUEST:\n %s", request);
         return 0;
@@ -506,4 +625,37 @@ void closeFds(int* clientFd, int* serverFd) {
 	if(serverFd && *serverFd >= 0) {
 		Close(*serverFd);
     }
+}
+
+int openListenfd(char *port)
+{
+    struct sockaddr_in ip4Addr;
+    int listenfd;
+
+    /* Get a list of potential server addresses */
+    // memset(&ip4Addr, 0, sizeof(struct sockaddr_in));
+    ip4Addr.sin_family = AF_INET;
+    ip4Addr.sin_port = htons(atoi(port));
+    ip4Addr.sin_addr.s_addr = INADDR_ANY;
+
+    if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+      perror("listenfd socket error");
+      return -1;
+    }
+
+    if (bind(listenfd, (struct sockaddr*)&ip4Addr, sizeof(struct sockaddr_in)) < 0) {
+      close(listenfd);
+      perror("listenfd bind error");
+      return -1;
+    }
+
+    fprintf(stderr, "listenfd bound to port %s\n", port);
+
+    if (listen(listenfd, 100) < 0) {
+      close(listenfd);
+      perror("listenfd listen error");
+      return -1;
+    }
+
+    return listenfd;
 }
