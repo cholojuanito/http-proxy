@@ -33,6 +33,7 @@
 #define DEFAULT_HTTP_PORT      "80"
 #define GET                    "GET"
 #define END_HTTP               "\r\n"
+#define END_HEADERS           "\r\n\r\n"
 #define HOST_KEY               "Host:"
 #define USER_AGENT_KEY         "User-Agent:"
 #define ACCEPT_KEY             "Accept:"
@@ -93,6 +94,9 @@ int openListenfd(char *port);
 
 int readFromClient(requestStateType* state);
 int handleNewClient(requestStateType* state);
+int writeToServer(requestStateType* state);
+int readFromServer(requestStateType* state);
+int writeToClient(requestStateType* state);
 
 void logInfo(char* buf);
 void proxyThread(void* arg);
@@ -313,66 +317,146 @@ int readFromClient(requestStateType* state) {
         state->bytesReadFromClient += numBytesRead;
 	}
 
-    if (numBytesRead < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
-        // no more data to read()
-        return 1;
-	}
-    else if (numBytesRead < 0 && (errno != EWOULDBLOCK && errno != EAGAIN)) {
-		perror("error reading");
-		return 0;
-	}
-    else {
+    if (strstr(state->requestBuf, END_HEADERS) != NULL) {
         // Ready to parse the request
-        int serverFd = -1;
         state->serverFd = -1;
         char errorBuf[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF], cacheKey[MAXBUF];
 
         int readVal = readRequest(state->requestBuf, state->proxyRequestBuf, host, port, cacheKey, query);
         if (!readVal) {
+            struct epoll_event event;
+	        struct eventAction *ea;
+            state->bytesToSendToServer = strlen(state->proxyRequestBuf);
+
             if (readNodeContent(cache, cacheKey, state->responseBuf, state->bytesReadFromServer) == 0) {
                 printf("Found in cache!\n");
 
-                // MODIFY THE EVENT AND CALLBACK INFO?
+                // Initialize the new event action
+                ea = malloc(sizeof(struct eventAction));
+                // Next action: Read from client
+                ea->callback = writeToClient;
 
-                int forwardVal = forwardToClient(state->clientFd, state->responseBuf, state->bytesReadFromServer);
-                if (forwardVal == -1) {
-                    fprintf(stderr, "Forward CACHE response to client error\n");
+                // Prep for writing to client
+                ea->arg = state;
+                event.data.ptr = ea;
+                event.events = EPOLLOUT | EPOLLET; // use edge-triggered monitoring
+                if (epoll_ctl(efd, EPOLL_CTL_MOD, state->serverFd, &event) < 0) {
+                    fprintf(stderr, "error adding event\n");
+                    exit(1);
                 }
+
+                // int forwardVal = forwardToClient(state->clientFd, state->responseBuf, state->bytesReadFromServer);
+                // if (forwardVal == -1) {
+                //     fprintf(stderr, "Forward CACHE response to client error\n");
+                // }
             }
-            else {
-                // Forward request to remote sever
+            else {                
+                // Create server file descriptor
+                state->serverFd = Open_clientfd(host, port);
 
-                // MODIFY THE EVENT AND CALLBACK INFO?
-
-
-                int bytesWritten = forwardToServer(host, port, &serverFd, state->proxyRequestBuf);
-                if (bytesWritten == -1) {
-                    fprintf(stderr, "forward response to server error.\n");
-                    strcpy(errorBuf, connectionFailStr);
-                    Rio_writen(state->clientFd, errorBuf, strlen(connectionFailStr));
+                if (state->serverFd < 0) {
+                    // Something went wrong with connecting to server
+                    if (state->serverFd == -1) {
+                        return -1;
+                    }
+                    // DNS lookup failed
+                    else {
+                        return -2;
+                    }
                 }
-                else if (bytesWritten == -2) {
-                    fprintf(stderr, "forward response to server error (dns look up fail).\n");
-                    strcpy(errorBuf, dnsFailStr);
-                    Rio_writen(state->clientFd, errorBuf, strlen(dnsFailStr));
+
+                // Set serverFd to be non-blocking
+                if (fcntl(state->serverFd, F_SETFL, fcntl(state->serverFd, F_GETFL) | O_NONBLOCK)) {
+                    fprintf(stderr, "error setting server socket to non-blocking\n");
+                    exit(1);
                 }
-                else {
 
-                    // MODIFY THE EVENT AND CALLBACK INFO?
+                // Initialize the new event action
+                ea = malloc(sizeof(struct eventAction));
+                // Next action: Read from client
+                ea->callback = writeToServer;
 
-
-                    int forwardVal = readAndForwardToClient(serverFd, state->clientFd, cacheKey, state->responseBuf);
-                    if (forwardVal == -1)
-                        fprintf(stderr, "forward response to client error\n");
-                    else if (forwardVal == -2)
-                        fprintf(stderr, "save response to cache error\n");
+                // Prep for writing to server
+                ea->arg = state;
+                event.data.ptr = ea;
+                event.events = EPOLLOUT | EPOLLET; // use edge-triggered monitoring
+                if (epoll_ctl(efd, EPOLL_CTL_ADD, state->serverFd, &event) < 0) {
+                    fprintf(stderr, "error adding event\n");
+                    exit(1);
                 }
             }
         }
-        //closeFds(&connFd, &serverFd);
-
-        return 0;
     }
+
+    if (numBytesRead < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
+        // no more data to read()
+        return 1;
+	}
+    else {
+		perror("error reading");
+		return 0;
+	}
+    return 0;
+}
+
+int writeToServer(requestStateType* state) {
+    int numBytesWritten = -1;
+    while ((numBytesWritten = write(state->serverFd, state->proxyRequestBuf, strlen(state->proxyRequestBuf))) < state->bytesToSendToServer) {
+    }
+    state->bytesSentToServer = numBytesWritten;
+
+    if (state->bytesToSendToServer == state->bytesSentToServer) {
+        struct epoll_event event;
+	    struct eventAction *ea;
+        // Initialize the new event action
+        ea = malloc(sizeof(struct eventAction));
+        // Next action: Read from client
+        ea->callback = readFromServer;
+
+        // Prep for reading from server
+        ea->arg = state;
+        event.data.ptr = ea;
+        event.events = EPOLLIN | EPOLLET; // use edge-triggered monitoring
+        if (epoll_ctl(efd, EPOLL_CTL_MOD, state->serverFd, &event) < 0) {
+            fprintf(stderr, "error adding event\n");
+            exit(1);
+        }
+    }
+    
+    if (numBytesWritten == -1 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
+        // no more data to read()
+        return 1;
+	}
+    else if (numBytesWritten == -1 && (errno != EWOULDBLOCK && errno != EAGAIN)) {
+		perror("error reading");
+		return 0;
+	}
+
+    return 1;
+}
+
+int readFromServer(requestStateType* state) {
+    int numBytesRead;
+    // Read from the client and keep track of the offset in case the request doesn't come all at once
+	while ((numBytesRead = read(state->serverFd, (state->responseBuf + state->bytesReadFromServer), MAXLINE)) > 0) {
+		printf("Received %d bytes\n", numBytesRead);
+        state->bytesReadFromServer += numBytesRead;
+	}
+
+
+    if (numBytesRead < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
+        // no more data to read()
+        return 1;
+	}
+    else {
+		perror("error reading");
+		return 0;
+	}
+    return 0;
+}
+
+int writeToClient(requestStateType* state) {
+    printf("WRITING TO CLIENT!");
     return 0;
 }
 
