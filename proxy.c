@@ -2,6 +2,8 @@
  * Tanner Davis - BYU CS 324 Winter 2019
  * 
  */ 
+#include "csapp.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -23,7 +25,7 @@
 #define QUEUE_SIZE           24
 #define MIN_PORT_NUMBER      1024
 #define MAX_PORT_NUMBER     65536
-#define TIMEOUT             1
+#define TIMEOUT             1000000
 #define CACHE_OFF              "off"
 #define FORWARD_SLASH          "/"
 #define HTTP_DELIM             "://"
@@ -70,7 +72,7 @@ int handleNewClient(int listenfd);
 
 void logInfo(char* buf);
 void proxyThread(void* arg);
-int readRequest(char* str, int clientFd, char* host, char* port, char* cacheKey, char* query);
+int readRequest(char* str, int clientFd, char* bufferedReq, char* host, char* port, char* cacheKey, char* query);
 int forwardToServer(char* host, char* port, int* serverFd, char* requestStr);
 int forwardToClient(int clientFd, char* response, unsigned int len);
 int readAndForwardToClient(int serverFd, int clientFd, char* cacheKey, char* response);
@@ -82,11 +84,15 @@ void closeFds(int* clientFd, int* serverFd);
 // END function declarations
 
 // Struct for callback functions and their arguments
-struct event_action {
+struct eventAction {
 	int (*callback)(int);
 	void *arg;
 };
 int efd; // epoll file descriptor
+
+struct requestState {
+
+};
 
 cacheList* cache; // Here be the cache
 volatile sig_atomic_t exitRequested = 0; // SIGINT flag
@@ -96,7 +102,7 @@ int main(int argc, char** argv) {
     int useCache = 1;
     struct epoll_event event;
 	struct epoll_event *events;
-    struct event_action *ea;
+    struct eventAction *ea;
     int *argptr; // Argument for the callback
     int listenFd;
     int i; // For iterating the events when one occurs
@@ -147,7 +153,7 @@ int main(int argc, char** argv) {
 		exit(1);
 	}
 
-    ea = malloc(sizeof(struct event_action));
+    ea = malloc(sizeof(struct eventAction));
     ea->callback = handleNewClient;
     argptr = malloc(sizeof(int));
     *argptr = listenFd;
@@ -163,33 +169,45 @@ int main(int argc, char** argv) {
     // Buffer where events are returned
 	events = calloc(MAX_EVENTS, sizeof(event));
 
-    // Wait for events to happen
+    // Wait for new client connection events to happen
     while (1) {        
 		n = epoll_wait(efd, events, MAX_EVENTS, -1);
-        // Iterate through the events and handle them
-		for (i = 0; i < n; i++) {
-            // Get the callback function and argument for the event
-			ea = (struct event_action *)events[i].data.ptr;
-			argptr = ea->arg;
+        if (n == 0) {
+            // Check SIGTERM flag
+            // Else
+            continue;
+        }
+        else if (n < 0) {
+            // An error occurred
+            fprintf(stderr, "An error occurred while waiting...\n");
+            continue;
+        }
+        else {
+            // Iterate through the events and handle them
+            for (i = 0; i < n; i++) {
+                // Get the callback function and argument for the event
+                ea = (struct eventAction *)events[i].data.ptr;
+                argptr = ea->arg;
 
-            // Check for errors
-			if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-				/* An error has occured on this fd */
-				fprintf (stderr, "epoll error on fd %d\n", *argptr);
-				close(*argptr);
-				free(ea->arg);
-				free(ea);
-				continue;
-			}
+                // Check for errors
+                if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+                    /* An error has occured on this fd */
+                    fprintf (stderr, "epoll error on fd %d\n", *argptr);
+                    close(*argptr);
+                    free(ea->arg);
+                    free(ea);
+                    continue;
+                }
 
-            // Call the callback function
-			if (!ea->callback(*argptr)) {
-				close(*argptr);
-				free(ea->arg);
-				free(ea);
-			}
+                // Call the callback function
+                if (!ea->callback(*argptr)) {
+                    close(*argptr);
+                    free(ea->arg);
+                    free(ea);
+                }
 
-		}
+            }
+        }
 	}
 
     
@@ -227,7 +245,7 @@ int handleNewClient(int listenfd) {
 	struct sockaddr_storage clientaddr;
 	struct epoll_event event;
 	int* argptr;
-	struct event_action* ea;
+	struct eventAction* ea;
 
 	clientlen = sizeof(struct sockaddr_storage); 
 
@@ -240,12 +258,12 @@ int handleNewClient(int listenfd) {
 			exit(1);
 		}
 
-		ea = malloc(sizeof(struct event_action));
+		ea = malloc(sizeof(struct eventAction));
 		ea->callback = handleClient;
 		argptr = malloc(sizeof(int));
 		*argptr = connfd;
 
-		// add event to epoll file descriptor
+		// add a read event to epoll file descriptor
 		ea->arg = argptr;
 		event.data.ptr = ea;
 		event.events = EPOLLIN | EPOLLET; // use edge-triggered monitoring
@@ -264,17 +282,55 @@ int handleNewClient(int listenfd) {
 	}
 }
 
-int handleClient(int connfd) {
+int handleClient(int connFd) {
 	int len;
-	char buf[MAXLINE]; 
-	while ((len = recv(connfd, buf, MAXLINE, 0)) > 0) {
+	char bufferedReq[MAXBUF];
+    // Read everything from the 
+	while ((len = read(connFd, bufferedReq, MAXLINE)) > 0) {
 		printf("Received %d bytes\n", len);
-		send(connfd, buf, len, 0);
+		//send(connFd, buf, len, 0);
 	}
+
 	if (len == 0) {
-		// EOF received.
-		// Closing the fd will automatically unregister the fd
-		// from the efd
+		int serverFd = -1;
+        char buf[MAXBUF], requestStr[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF];
+        char cacheKey[MAXBUF], response[MAX_OBJECT_SIZE];
+        unsigned int length;
+
+        int readVal = readRequest(requestStr, connFd, bufferedReq, host, port, cacheKey, query);
+        if (!readVal) {
+            if (readNodeContent(cache, cacheKey, response, &length) == 0) {
+                printf("Found in cache!\n");
+                int forwardVal = forwardToClient(connFd, response, length);
+                if (forwardVal == -1) {
+                    fprintf(stderr, "Forward CACHE response to client error\n");
+                }
+            }
+            else {
+                // Forward request to remote sever
+                int bytesWritten = forwardToServer(host, port, &serverFd, requestStr);
+                if (bytesWritten == -1) {
+                    fprintf(stderr, "forward response to server error.\n");
+                    strcpy(buf, connectionFailStr);
+                    Rio_writen(connFd, buf, strlen(connectionFailStr));
+                }
+                else if (bytesWritten == -2) {
+                    fprintf(stderr, "forward response to server error (dns look up fail).\n");
+                    strcpy(buf, dnsFailStr);
+                    Rio_writen(connFd, buf, strlen(dnsFailStr));
+                }
+                else {
+                    int forwardVal = readAndForwardToClient(serverFd, connFd, cacheKey, response);
+                    if (forwardVal == -1)
+                        fprintf(stderr, "forward response to client error\n");
+                    else if (forwardVal == -2)
+                        fprintf(stderr, "save response to cache error\n");
+                }
+            }
+        }
+
+        //closeFds(&connFd, &serverFd);
+
 		return 0;
 	} else if (errno == EWOULDBLOCK || errno == EAGAIN) {
 		return 1;
@@ -296,7 +352,7 @@ void proxyThread(void* arg) {
         unsigned int length;
 
         // Read the client request
-        int readVal = readRequest(requestStr, clientFd, host, port, cacheKey, query);
+        int readVal = 0;  //readRequest(requestStr, clientFd, bufferedReq, host, port, cacheKey, query);
 
         //printf("Read data from %s:%s\n",host,port);
         fflush(stdout);
@@ -341,16 +397,14 @@ void proxyThread(void* arg) {
 }
 
 
-int readRequest(char* request, int clientFd, char* host, char* port, char* cacheKey, char* query) {
+int readRequest(char* request, int clientFd, char* bufferedReq, char* host, char* port, char* cacheKey, char* query) {
     char buf[MAXBUF], method[MAXBUF], protocol[MAXBUF], hostAndPort[MAXBUF], version[MAXBUF];
      rio_t rioClient;
 
     Rio_readinitb(&rioClient, clientFd);
-    if (Rio_readlineb(&rioClient, buf, MAXBUF) == -1) {
-        return -1;
-    }
+    
 
-    if (parseRequest(buf, method, protocol, version, hostAndPort, query) == -1) {
+    if (parseRequest(bufferedReq, method, protocol, version, hostAndPort, query) == -1) {
         return -1;
     }
 
