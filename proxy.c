@@ -257,7 +257,7 @@ void logInfo(char* buf) {
 
 int handleNewClient(int listenfd) {
 	socklen_t clientlen;
-	int connfd;
+	int clientFd;
 	struct sockaddr_storage clientaddr;
 	struct epoll_event event;
 	int* argptr;
@@ -266,10 +266,10 @@ int handleNewClient(int listenfd) {
 	clientlen = sizeof(struct sockaddr_storage); 
 
 	// loop and get all the connections that are available
-	while ((connfd = accept(listenfd, (struct sockaddr*)&clientaddr, &clientlen)) > 0) {
+	while ((clientFd = accept(listenfd, (struct sockaddr*)&clientaddr, &clientlen)) > 0) {
 
 		// set fd to non-blocking (set flags while keeping existing flags)
-		if (fcntl(connfd, F_SETFL, fcntl(connfd, F_GETFL, 0) | O_NONBLOCK) < 0) {
+		if (fcntl(clientFd, F_SETFL, fcntl(clientFd, F_GETFL, 0) | O_NONBLOCK) < 0) {
 			fprintf(stderr, "error setting socket option\n");
 			exit(1);
 		}
@@ -277,13 +277,13 @@ int handleNewClient(int listenfd) {
 		ea = malloc(sizeof(struct eventAction));
 		ea->callback = handleClient;
 		argptr = malloc(sizeof(int));
-		*argptr = connfd;
+		*argptr = clientFd;
 
 		// add a read event to epoll file descriptor
 		ea->arg = argptr;
 		event.data.ptr = ea;
 		event.events = EPOLLIN | EPOLLET; // use edge-triggered monitoring
-		if (epoll_ctl(efd, EPOLL_CTL_ADD, connfd, &event) < 0) {
+		if (epoll_ctl(efd, EPOLL_CTL_ADD, clientFd, &event) < 0) {
 			fprintf(stderr, "error adding event\n");
 			exit(1);
 		}
