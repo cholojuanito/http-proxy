@@ -63,12 +63,36 @@ static const char* connectionFailStr = "HTTP/1.0 400 \
     /* <html><head></head><body><p>\
     Couldn't connect with this server.</p></body></html> */
 
+// Struct for keeping track of a request's state
+typedef struct requestState {
+    int clientFd;
+    int serverFd;
+    char* requestBuf; // Buffer for original request
+    char* proxyRequestBuf; // Buffer for proxy-made request
+    char* responseBuf; // Buffer for server response or cache
+    size_t bytesReadFromClient;
+    size_t bytesToSendToServer;
+    size_t bytesSentToServer;
+    size_t bytesReadFromServer;
+    size_t bytesSentToClient;
+} requestStateType;
+
+// Struct for callback functions and their arguments
+struct eventAction {
+	int (*callback)(requestStateType*);
+	void *arg;
+};
+int efd; // epoll file descriptor
+
+cacheList* cache; // Here be the cache
+volatile sig_atomic_t exitRequested = 0; // SIGINT flag
+
 // Function declarations
 void usage();
 int openListenfd(char *port);
 
-int handleClient(int connfd);
-int handleNewClient(int listenfd);
+int readFromClient(requestStateType* state);
+int handleNewClient(requestStateType* state);
 
 void logInfo(char* buf);
 void proxyThread(void* arg);
@@ -83,43 +107,13 @@ void getHostAndPort(char* hostAndPort, char* host, char* port);
 void closeFds(int* clientFd, int* serverFd);
 // END function declarations
 
-// Struct for callback functions and their arguments
-struct eventAction {
-	int (*callback)(int);
-	void *arg;
-};
-int efd; // epoll file descriptor
-
-// Enum Request States
-static const int READ_REQUEST =  0;
-static const int SEND_REQUEST =  1;
-static const int READ_RESPONSE = 2;
-static const int SEND_RESPONSE = 3;
-
-struct requestState {
-    int clientFd;
-    int serverFd;
-    int currentState; // One of the enums above
-    char* requestBuf; // Buffer for original request
-    char* proxyRequestBuf; // Buffer for proxy-made request
-    char* responseBuf; // Buffer for server response or cache
-    size_t bytesReadFromCLient;
-    size_t bytesToSendToServer;
-    size_t bytesSentToServer;
-    size_t bytesReadFromServer;
-    size_t bytesSentToClient;
-};
-
-cacheList* cache; // Here be the cache
-volatile sig_atomic_t exitRequested = 0; // SIGINT flag
-
 int main(int argc, char** argv) {
     char* port;
     int useCache = 1;
     struct epoll_event event;
 	struct epoll_event *events;
     struct eventAction *ea;
-    int *argptr; // Argument for the callback
+    struct requestState *argptr; // Argument for the callback
     int listenFd;
     int i; // For iterating the events when one occurs
     size_t n; // Number of events while waiting
@@ -171,8 +165,8 @@ int main(int argc, char** argv) {
 
     ea = malloc(sizeof(struct eventAction));
     ea->callback = handleNewClient;
-    argptr = malloc(sizeof(int));
-    *argptr = listenFd;
+    argptr = malloc(sizeof(requestStateType));
+    argptr->clientFd = listenFd;
 
     ea->arg = argptr;
     event.data.ptr = ea;
@@ -208,16 +202,16 @@ int main(int argc, char** argv) {
                 // Check for errors
                 if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
                     /* An error has occured on this fd */
-                    fprintf (stderr, "epoll error on fd %d\n", *argptr);
-                    close(*argptr);
+                    fprintf (stderr, "epoll error on fd %d\n", listenFd);
+                    close(listenFd);
                     free(ea->arg);
                     free(ea);
                     continue;
                 }
 
                 // Call the callback function
-                if (!ea->callback(*argptr)) {
-                    close(*argptr);
+                if (!ea->callback(argptr)) {
+                    close(listenFd);
                     free(ea->arg);
                     free(ea);
                 }
@@ -255,18 +249,19 @@ void logInfo(char* buf) {
     fclose(logFile);
 }
 
-int handleNewClient(int listenfd) {
+int handleNewClient(requestStateType* state) {
 	socklen_t clientlen;
 	int clientFd;
 	struct sockaddr_storage clientaddr;
 	struct epoll_event event;
-	int* argptr;
-	struct eventAction* ea;
+	struct eventAction *ea;
+    struct requestState *newReqState;
 
 	clientlen = sizeof(struct sockaddr_storage); 
 
 	// loop and get all the connections that are available
-	while ((clientFd = accept(listenfd, (struct sockaddr*)&clientaddr, &clientlen)) > 0) {
+    // ***Even though this says state->clientFd it is the proxy's listenFd.***
+	while ((clientFd = accept(state->clientFd, (struct sockaddr*)&clientaddr, &clientlen)) > 0) {
 
 		// set fd to non-blocking (set flags while keeping existing flags)
 		if (fcntl(clientFd, F_SETFL, fcntl(clientFd, F_GETFL, 0) | O_NONBLOCK) < 0) {
@@ -274,13 +269,25 @@ int handleNewClient(int listenfd) {
 			exit(1);
 		}
 
+        // Initialize a new request state
+        newReqState = malloc(sizeof(struct requestState));
+        newReqState->clientFd = clientFd;
+        newReqState->requestBuf = malloc(MAX_OBJECT_SIZE);
+        newReqState->proxyRequestBuf = malloc(MAX_OBJECT_SIZE);
+        newReqState->responseBuf = malloc(MAX_OBJECT_SIZE);
+        newReqState->bytesReadFromClient = 0;
+        newReqState->bytesToSendToServer = 0;
+        newReqState->bytesSentToServer = 0;
+        newReqState->bytesReadFromServer = 0;
+        newReqState->bytesSentToClient = 0;
+
+        // Initialize the new event action
 		ea = malloc(sizeof(struct eventAction));
-		ea->callback = handleClient;
-		argptr = malloc(sizeof(int));
-		*argptr = clientFd;
+        // Next action: Read from client
+		ea->callback = readFromClient;
 
 		// add a read event to epoll file descriptor
-		ea->arg = argptr;
+		ea->arg = newReqState;
 		event.data.ptr = ea;
 		event.events = EPOLLIN | EPOLLET; // use edge-triggered monitoring
 		if (epoll_ctl(efd, EPOLL_CTL_ADD, clientFd, &event) < 0) {
@@ -298,45 +305,56 @@ int handleNewClient(int listenfd) {
 	}
 }
 
-int handleClient(int connFd) {
-	int len;
-	char bufferedReq[MAXBUF];
-    // Read everything from the 
-	while ((len = read(connFd, bufferedReq, MAXLINE)) > 0) {
-		printf("Received %d bytes\n", len);
-		//send(connFd, buf, len, 0);
+int readFromClient(requestStateType* state) {
+	int numBytesRead;
+    // Read from the client and keep track of the offset in case the request doesn't come all at once
+	while ((numBytesRead = read(state->clientFd, (state->requestBuf + state->bytesReadFromClient), MAXLINE)) > 0) {
+		printf("Received %d bytes\n", numBytesRead);
+        state->bytesReadFromClient += numBytesRead;
 	}
 
-	if (len == 0) {
+	if (numBytesRead == 0) {
+        // Ready to parse the request
 		int serverFd = -1;
         char buf[MAXBUF], requestStr[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF];
-        char cacheKey[MAXBUF], response[MAX_OBJECT_SIZE];
+        char cacheKey[MAXBUF];
         unsigned int length;
 
-        int readVal = readRequest(requestStr, connFd, bufferedReq, host, port, cacheKey, query);
+        int readVal = readRequest(requestStr, state->clientFd, state->requestBuf, host, port, cacheKey, query);
         if (!readVal) {
-            if (readNodeContent(cache, cacheKey, response, &length) == 0) {
+            if (readNodeContent(cache, cacheKey, state->responseBuf, &length) == 0) {
                 printf("Found in cache!\n");
-                int forwardVal = forwardToClient(connFd, response, length);
+
+                // MODIFY THE EVENT AND CALLBACK INFO?
+
+                int forwardVal = forwardToClient(state->clientFd, state->responseBuf, length);
                 if (forwardVal == -1) {
                     fprintf(stderr, "Forward CACHE response to client error\n");
                 }
             }
             else {
                 // Forward request to remote sever
+
+                // MODIFY THE EVENT AND CALLBACK INFO?
+
+
                 int bytesWritten = forwardToServer(host, port, &serverFd, requestStr);
                 if (bytesWritten == -1) {
                     fprintf(stderr, "forward response to server error.\n");
                     strcpy(buf, connectionFailStr);
-                    Rio_writen(connFd, buf, strlen(connectionFailStr));
+                    Rio_writen(state->clientFd, buf, strlen(connectionFailStr));
                 }
                 else if (bytesWritten == -2) {
                     fprintf(stderr, "forward response to server error (dns look up fail).\n");
                     strcpy(buf, dnsFailStr);
-                    Rio_writen(connFd, buf, strlen(dnsFailStr));
+                    Rio_writen(state->clientFd, buf, strlen(dnsFailStr));
                 }
                 else {
-                    int forwardVal = readAndForwardToClient(serverFd, connFd, cacheKey, response);
+
+                    // MODIFY THE EVENT AND CALLBACK INFO?
+
+
+                    int forwardVal = readAndForwardToClient(serverFd, state->clientFd, cacheKey, state->responseBuf);
                     if (forwardVal == -1)
                         fprintf(stderr, "forward response to client error\n");
                     else if (forwardVal == -2)
@@ -349,8 +367,8 @@ int handleClient(int connFd) {
 
 		return 0;
 	} else if (errno == EWOULDBLOCK || errno == EAGAIN) {
+        // no more data to read()
 		return 1;
-		// no more data to read()
 	} else {
 		perror("error reading");
 		return 0;
