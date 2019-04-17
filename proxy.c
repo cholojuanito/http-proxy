@@ -90,8 +90,24 @@ struct eventAction {
 };
 int efd; // epoll file descriptor
 
-struct requestState {
+// Enum Request States
+static const int READ_REQUEST =  0;
+static const int SEND_REQUEST =  1;
+static const int READ_RESPONSE = 2;
+static const int SEND_RESPONSE = 3;
 
+struct requestState {
+    int clientFd;
+    int serverFd;
+    int currentState; // One of the enums above
+    char* requestBuf; // Buffer for original request
+    char* proxyRequestBuf; // Buffer for proxy-made request
+    char* responseBuf; // Buffer for server response or cache
+    size_t bytesReadFromCLient;
+    size_t bytesToSendToServer;
+    size_t bytesSentToServer;
+    size_t bytesReadFromServer;
+    size_t bytesSentToClient;
 };
 
 cacheList* cache; // Here be the cache
