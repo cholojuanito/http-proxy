@@ -37,7 +37,7 @@ int addNode(cacheNode* node, cacheList* list);
 void deleteNode(cacheNode* node);
 cacheNode* findNode(cacheList* list, char* index);
 
-int readNodeContent(cacheList* list, char* index, char* content, unsigned int *len);
+int readNodeContent(cacheList* list, char* index, char* content, unsigned int len);
 int insertNodeContent(cacheList* list, char* index, char* content, unsigned int len);
 
 

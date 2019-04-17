@@ -96,7 +96,7 @@ int handleNewClient(requestStateType* state);
 
 void logInfo(char* buf);
 void proxyThread(void* arg);
-int readRequest(char* str, int clientFd, char* bufferedReq, char* host, char* port, char* cacheKey, char* query);
+int readRequest(char* clientRequest, char* proxyReq, char* host, char* port, char* cacheKey, char* query);
 int forwardToServer(char* host, char* port, int* serverFd, char* requestStr);
 int forwardToClient(int clientFd, char* response, unsigned int len);
 int readAndForwardToClient(int serverFd, int clientFd, char* cacheKey, char* response);
@@ -313,21 +313,28 @@ int readFromClient(requestStateType* state) {
         state->bytesReadFromClient += numBytesRead;
 	}
 
-	if (numBytesRead == 0) {
+    if (numBytesRead < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
+        // no more data to read()
+        return 1;
+	}
+    else if (numBytesRead < 0 && (errno != EWOULDBLOCK && errno != EAGAIN)) {
+		perror("error reading");
+		return 0;
+	}
+    else {
         // Ready to parse the request
-		int serverFd = -1;
-        char buf[MAXBUF], requestStr[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF];
-        char cacheKey[MAXBUF];
-        unsigned int length;
+        int serverFd = -1;
+        state->serverFd = -1;
+        char errorBuf[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF], cacheKey[MAXBUF];
 
-        int readVal = readRequest(requestStr, state->clientFd, state->requestBuf, host, port, cacheKey, query);
+        int readVal = readRequest(state->requestBuf, state->proxyRequestBuf, host, port, cacheKey, query);
         if (!readVal) {
-            if (readNodeContent(cache, cacheKey, state->responseBuf, &length) == 0) {
+            if (readNodeContent(cache, cacheKey, state->responseBuf, state->bytesReadFromServer) == 0) {
                 printf("Found in cache!\n");
 
                 // MODIFY THE EVENT AND CALLBACK INFO?
 
-                int forwardVal = forwardToClient(state->clientFd, state->responseBuf, length);
+                int forwardVal = forwardToClient(state->clientFd, state->responseBuf, state->bytesReadFromServer);
                 if (forwardVal == -1) {
                     fprintf(stderr, "Forward CACHE response to client error\n");
                 }
@@ -338,16 +345,16 @@ int readFromClient(requestStateType* state) {
                 // MODIFY THE EVENT AND CALLBACK INFO?
 
 
-                int bytesWritten = forwardToServer(host, port, &serverFd, requestStr);
+                int bytesWritten = forwardToServer(host, port, &serverFd, state->proxyRequestBuf);
                 if (bytesWritten == -1) {
                     fprintf(stderr, "forward response to server error.\n");
-                    strcpy(buf, connectionFailStr);
-                    Rio_writen(state->clientFd, buf, strlen(connectionFailStr));
+                    strcpy(errorBuf, connectionFailStr);
+                    Rio_writen(state->clientFd, errorBuf, strlen(connectionFailStr));
                 }
                 else if (bytesWritten == -2) {
                     fprintf(stderr, "forward response to server error (dns look up fail).\n");
-                    strcpy(buf, dnsFailStr);
-                    Rio_writen(state->clientFd, buf, strlen(dnsFailStr));
+                    strcpy(errorBuf, dnsFailStr);
+                    Rio_writen(state->clientFd, errorBuf, strlen(dnsFailStr));
                 }
                 else {
 
@@ -362,17 +369,11 @@ int readFromClient(requestStateType* state) {
                 }
             }
         }
-
         //closeFds(&connFd, &serverFd);
 
-		return 0;
-	} else if (errno == EWOULDBLOCK || errno == EAGAIN) {
-        // no more data to read()
-		return 1;
-	} else {
-		perror("error reading");
-		return 0;
-	}
+        return 0;
+    }
+    return 0;
 }
 
 
@@ -431,14 +432,14 @@ void proxyThread(void* arg) {
 }
 
 
-int readRequest(char* request, int clientFd, char* bufferedReq, char* host, char* port, char* cacheKey, char* query) {
+int readRequest(char* clientRequest, char* proxyReq, char* host, char* port, char* cacheKey, char* query) {
     char buf[MAXBUF], method[MAXBUF], protocol[MAXBUF], hostAndPort[MAXBUF], version[MAXBUF];
-     rio_t rioClient;
+    //  rio_t rioClient;
 
-    Rio_readinitb(&rioClient, clientFd);
+    // Rio_readinitb(&rioClient, clientFd);
     
 
-    if (parseRequest(bufferedReq, method, protocol, version, hostAndPort, query) == -1) {
+    if (parseRequest(clientRequest, method, protocol, version, hostAndPort, query) == -1) {
         return -1;
     }
 
@@ -448,11 +449,11 @@ int readRequest(char* request, int clientFd, char* bufferedReq, char* host, char
     // GET requests
     if (strstr(method, GET)) {
 
-        strcpy(request, method);
-        strcat(request, " ");
-        strcat(request, query);
-        strcat(request, " ");
-        strcat(request, httpVersionHeadr);
+        strcpy(proxyReq, method);
+        strcat(proxyReq, " ");
+        strcat(proxyReq, query);
+        strcat(proxyReq, " ");
+        strcat(proxyReq, httpVersionHeadr);
 
         // Add Host information if present
         if (strlen(host)) {
@@ -461,34 +462,34 @@ int readRequest(char* request, int clientFd, char* bufferedReq, char* host, char
             strcat(buf, ":");
             strcat(buf, port);
             strcat(buf, END_HTTP);
-            strcat(request, buf);
+            strcat(proxyReq, buf);
         }
 
         // Add necessary headers
-        strcat(request, userAgentHeadr);
-        strcat(request, acceptStr);
-        strcat(request, acceptEncoding);
-        strcat(request, connectionHeadr);
-        strcat(request, proxyConnectionHeadr);
+        strcat(proxyReq, userAgentHeadr);
+        strcat(proxyReq, acceptStr);
+        strcat(proxyReq, acceptEncoding);
+        strcat(proxyReq, connectionHeadr);
+        strcat(proxyReq, proxyConnectionHeadr);
 
 
         // Copy any other relavant headers
-        while(Rio_readlineb(&rioClient, buf, MAXBUF) > 0) {
-            // End when you see '\r\n'
-            if (!strcmp(buf, END_HTTP)) {
-                strcat(request, END_HTTP);
-                break;
-            }
-            // Ignore these headers, we overwrote them
-            else if (strstr(buf, USER_AGENT_KEY) || strstr(buf, ACCEPT_KEY) || strstr(buf, ACCEPT_ENCODE_KEY)
-                    || strstr(buf, PROXY_KEY) || strstr(buf, CONNECTION_KEY) || strstr(buf, COOKIE_KEY)
-                    || strstr(buf, HOST_KEY)) {
-                    continue;
-            }
-            else {
-                strcat(request, buf);
-            }
-        }
+        // while(Rio_readlineb(&rioClient, buf, MAXBUF) > 0) {
+        //     // End when you see '\r\n'
+        //     if (!strcmp(buf, END_HTTP)) {
+        //         strcat(request, END_HTTP);
+        //         break;
+        //     }
+        //     // Ignore these headers, we overwrote them
+        //     else if (strstr(buf, USER_AGENT_KEY) || strstr(buf, ACCEPT_KEY) || strstr(buf, ACCEPT_ENCODE_KEY)
+        //             || strstr(buf, PROXY_KEY) || strstr(buf, CONNECTION_KEY) || strstr(buf, COOKIE_KEY)
+        //             || strstr(buf, HOST_KEY)) {
+        //             continue;
+        //     }
+        //     else {
+        //         strcat(request, buf);
+        //     }
+        // }
 
         // Add caching information here
         strcpy(cacheKey, host);
@@ -505,8 +506,6 @@ int readRequest(char* request, int clientFd, char* bufferedReq, char* host, char
         strcat(logBuf, port);
         strcat(logBuf, query);
         strcat(logBuf, "\n");
-
-        //fprintf(stderr, "NEW REQUEST:\n %s", request);
         return 0;
     }
 
