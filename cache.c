@@ -94,23 +94,23 @@ cacheNode* findNode(cacheList* list, char* key) {
     return NULL;
 }
 
-int readNodeContent(cacheList* list, char* key, char* value, unsigned int len) {
+int readNodeContent(cacheList* list, char* key, char* value, unsigned int *len) {
     if (!list) {
         return -1;
     }
 
-    pthread_rwlock_rdlock(list->lock);
+    //pthread_rwlock_rdlock(list->lock);
 
     cacheNode* tmp = findNode(list, key);
 
     if (!tmp) {
-        pthread_rwlock_unlock(list->lock);
+        //pthread_rwlock_unlock(list->lock);
         return -1;
     }
 
-    len = tmp->length;
-    memcpy(value, tmp->value, len);
-    pthread_rwlock_unlock(list->lock);
+    *len = tmp->length;
+    memcpy(value, tmp->value, *len);
+    //pthread_rwlock_unlock(list->lock);
 
     return 0;
 

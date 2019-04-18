@@ -53,16 +53,17 @@ static const char* proxyConnectionHeadr = "Proxy-Connection: close\r\n";
 static const char* httpVersionHeadr = "HTTP/1.0\r\n";
 static const char* acceptStr = "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n";
 static const char* acceptEncoding = "Accept-Encoding: gzip, deflate\r\n";
-static const char* dnsFailStr = "HTTP/1.0 400 \
+/*static const char* dnsFailStr = "HTTP/1.0 400 \
     Bad Request\r\nServer: CS324-Proxy\r\nContent-Length: 0\r\nConnection: \
     close\r\nContent-Type: text/html\r\n\r\n";
-    /* <html><head></head><body><p>\
-     Couldn't connect with this server because of DNS issues.</p></body></html> */
+    / <html><head></head><body><p>\
+     Couldn't connect with this server because of DNS issues.</p></body></html> /
 static const char* connectionFailStr = "HTTP/1.0 400 \
     Bad Request\r\nServer: CS324-Proxy\r\nContent-Length: 0\r\nConnection: \
     close\r\nContent-Type: text/html\r\n\r\n";
-    /* <html><head></head><body><p>\
-    Couldn't connect with this server.</p></body></html> */
+    / <html><head></head><body><p>\
+    Couldn't connect with this server.</p></body></html> /
+*/
 
 // Struct for keeping track of a request's state
 typedef struct requestState {
@@ -109,7 +110,7 @@ int readAndForwardToClient(int serverFd, int clientFd, char* cacheKey, char* res
 int append(char* response, char* str, unsigned int addSize, unsigned int* prevSize);
 int parseRequest(char* buf, char* method, char* protocol, char* version, char* hostAndPort, char* query);
 void getHostAndPort(char* hostAndPort, char* host, char* port);
-void closeFds(int* clientFd, int* serverFd);
+void closeFds(int clientFd, int serverFd);
 // END function declarations
 
 int main(int argc, char** argv) {
@@ -208,7 +209,7 @@ int main(int argc, char** argv) {
                 if (events[i].events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
                     /* An error has occured on this fd */
                     fprintf (stderr, "epoll error on fd %d\n", listenFd);
-                    close(listenFd);
+                    //close(listenFd);
                     free(ea->arg);
                     free(ea);
                     continue;
@@ -216,10 +217,9 @@ int main(int argc, char** argv) {
 
                 // Call the callback function
                 if (!ea->callback(argptr)) {
-                    close(listenFd);
+                    //close(listenFd);
                     free(ea->arg);
                     free(ea);
-                    break;
                 }
 
             }
@@ -324,6 +324,7 @@ int readFromClient(requestStateType* state) {
         // Ready to parse the request
         state->serverFd = -1;
         char host[MAXBUF], port[MAXBUF], query[MAXBUF];
+        unsigned int cacheBytesRead;
 
         int readVal = readRequest(state->requestBuf, state->proxyRequestBuf, host, port, state->cacheKey, query);
         if (!readVal) {
@@ -331,8 +332,9 @@ int readFromClient(requestStateType* state) {
 	        struct eventAction *ea;
             state->bytesToSendToServer = strlen(state->proxyRequestBuf);
 
-            if (readNodeContent(cache, state->cacheKey, state->responseBuf, state->bytesReadFromServer) == 0) {
+            if (readNodeContent(cache, state->cacheKey, state->responseBuf, &cacheBytesRead) == 0) {
                 printf("Found in cache!\n");
+                state->bytesReadFromServer = cacheBytesRead;
 
                 // Initialize the new event action
                 ea = malloc(sizeof(struct eventAction));
@@ -343,7 +345,7 @@ int readFromClient(requestStateType* state) {
                 ea->arg = state;
                 event.data.ptr = ea;
                 event.events = EPOLLOUT | EPOLLET; // use edge-triggered monitoring
-                if (epoll_ctl(efd, EPOLL_CTL_MOD, state->serverFd, &event) < 0) {
+                if (epoll_ctl(efd, EPOLL_CTL_MOD, state->clientFd, &event) < 0) {
                     fprintf(stderr, "error adding event\n");
                     exit(1);
                 }                
@@ -510,61 +512,6 @@ int writeToClient(requestStateType* state) {
     }
 
     return 1;
-}
-
-
-void proxyThread(void* arg) {    
-    //printf("pid: %u\n", (unsigned int) pthread_self());
-    while (exitRequested == 0) {
-        int clientFd = 1;
-        int serverFd = -1;
-        char buf[MAXBUF], requestStr[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF];
-        char cacheKey[MAXBUF], response[MAX_OBJECT_SIZE];
-        unsigned int length;
-
-        // Read the client request
-        int readVal = 0;  //readRequest(requestStr, clientFd, bufferedReq, host, port, cacheKey, query);
-
-        //printf("Read data from %s:%s\n",host,port);
-        fflush(stdout);
-
-        if (!readVal) {
-            if (readNodeContent(cache, cacheKey, response, &length) == 0) {
-                printf("Found in cache!\n");
-                int forwardVal = forwardToClient(clientFd, response, length);
-                if (forwardVal == -1) {
-                    fprintf(stderr, "Forward CACHE response to client error\n");
-                }
-                //Close(clientFd);
-            }
-            else {
-                // Forward request to remote sever
-                int bytesWritten = forwardToServer(host, port, &serverFd, requestStr);
-                if (bytesWritten == -1) {
-                    fprintf(stderr, "forward response to server error.\n");
-                    strcpy(buf, connectionFailStr);
-                    Rio_writen(clientFd, buf, strlen(connectionFailStr));
-                }
-                else if (bytesWritten == -2) {
-                    fprintf(stderr, "forward response to server error (dns look up fail).\n");
-                    strcpy(buf, dnsFailStr);
-                    Rio_writen(clientFd, buf, strlen(dnsFailStr));
-                }
-                else {
-                    int forwardVal = readAndForwardToClient(serverFd, clientFd, cacheKey, response);
-                    if (forwardVal == -1)
-                        fprintf(stderr, "forward response to client error\n");
-                    else if (forwardVal == -2)
-                        fprintf(stderr, "save response to cache error\n");
-                }
-            }
-        }
-
-        closeFds(&clientFd, &serverFd);
-
-        // Break out only on SIGINT
-    }
-    return;
 }
 
 
@@ -824,13 +771,13 @@ int append(char* response, char* str, unsigned int addSize, unsigned int* prevSi
 	return 1;
 }
 
-void closeFds(int* clientFd, int* serverFd) {
-    if(clientFd && *clientFd >= 0) {
-		Close(*clientFd);
+void closeFds(int clientFd, int serverFd) {
+    if(clientFd >= 0) {
+		Close(clientFd);
     }
 
-	if(serverFd && *serverFd >= 0) {
-		Close(*serverFd);
+	if(serverFd >= 0) {
+		Close(serverFd);
     }
 }
 
