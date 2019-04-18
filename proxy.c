@@ -71,6 +71,7 @@ typedef struct requestState {
     char* requestBuf; // Buffer for original request
     char* proxyRequestBuf; // Buffer for proxy-made request
     char* responseBuf; // Buffer for server response or cache
+    char* cacheKey;
     size_t bytesReadFromClient;
     size_t bytesToSendToServer;
     size_t bytesSentToServer;
@@ -185,7 +186,7 @@ int main(int argc, char** argv) {
 
     // Wait for new client connection events to happen
     while (1) {        
-		n = epoll_wait(efd, events, MAX_EVENTS, -1);
+		n = epoll_wait(efd, events, MAX_EVENTS, 1000);
         if (n == 0) {
             // Check SIGTERM flag
             // Else
@@ -218,6 +219,7 @@ int main(int argc, char** argv) {
                     close(listenFd);
                     free(ea->arg);
                     free(ea);
+                    break;
                 }
 
             }
@@ -279,6 +281,7 @@ int handleNewClient(requestStateType* state) {
         newReqState->requestBuf = malloc(MAX_OBJECT_SIZE);
         newReqState->proxyRequestBuf = malloc(MAX_OBJECT_SIZE);
         newReqState->responseBuf = malloc(MAX_OBJECT_SIZE);
+        newReqState->cacheKey = malloc(MAXBUF);
         newReqState->bytesReadFromClient = 0;
         newReqState->bytesToSendToServer = 0;
         newReqState->bytesSentToServer = 0;
@@ -320,15 +323,15 @@ int readFromClient(requestStateType* state) {
     if (strstr(state->requestBuf, END_HEADERS) != NULL) {
         // Ready to parse the request
         state->serverFd = -1;
-        char errorBuf[MAXBUF], host[MAXBUF], port[MAXBUF], query[MAXBUF], cacheKey[MAXBUF];
+        char host[MAXBUF], port[MAXBUF], query[MAXBUF];
 
-        int readVal = readRequest(state->requestBuf, state->proxyRequestBuf, host, port, cacheKey, query);
+        int readVal = readRequest(state->requestBuf, state->proxyRequestBuf, host, port, state->cacheKey, query);
         if (!readVal) {
             struct epoll_event event;
 	        struct eventAction *ea;
             state->bytesToSendToServer = strlen(state->proxyRequestBuf);
 
-            if (readNodeContent(cache, cacheKey, state->responseBuf, state->bytesReadFromServer) == 0) {
+            if (readNodeContent(cache, state->cacheKey, state->responseBuf, state->bytesReadFromServer) == 0) {
                 printf("Found in cache!\n");
 
                 // Initialize the new event action
@@ -343,12 +346,7 @@ int readFromClient(requestStateType* state) {
                 if (epoll_ctl(efd, EPOLL_CTL_MOD, state->serverFd, &event) < 0) {
                     fprintf(stderr, "error adding event\n");
                     exit(1);
-                }
-
-                // int forwardVal = forwardToClient(state->clientFd, state->responseBuf, state->bytesReadFromServer);
-                // if (forwardVal == -1) {
-                //     fprintf(stderr, "Forward CACHE response to client error\n");
-                // }
+                }                
             }
             else {                
                 // Create server file descriptor
@@ -401,9 +399,10 @@ int readFromClient(requestStateType* state) {
 
 int writeToServer(requestStateType* state) {
     int numBytesWritten = -1;
-    while ((numBytesWritten = write(state->serverFd, state->proxyRequestBuf, strlen(state->proxyRequestBuf))) < state->bytesToSendToServer) {
-    }
-    state->bytesSentToServer = numBytesWritten;
+    do {
+        numBytesWritten = write(state->serverFd, (state->proxyRequestBuf + state->bytesSentToServer), state->bytesToSendToServer);
+        state->bytesSentToServer += numBytesWritten;
+    } while (numBytesWritten <= 0);
 
     if (state->bytesToSendToServer == state->bytesSentToServer) {
         struct epoll_event event;
@@ -443,21 +442,74 @@ int readFromServer(requestStateType* state) {
         state->bytesReadFromServer += numBytesRead;
 	}
 
+    if (strstr(state->responseBuf, END_HEADERS) != NULL) {
+
+        if (strlen(state->responseBuf) < MAX_OBJECT_SIZE) {            
+            // Add to cache
+            int addToCacheVal = insertNodeContent(cache, state->cacheKey, state->responseBuf, strlen(state->responseBuf));
+            if (addToCacheVal == -1) {
+                printf("Cache error!\n");
+                return -2;
+            }
+            else if (addToCacheVal == -2) {
+                printf("Not enough space in cache!\n");
+                return -2;
+            }
+            else {
+                printf("Added response to cache!\n");
+            }
+        }
+
+        struct epoll_event event;
+	    struct eventAction *ea;
+        // Initialize the new event action
+        ea = malloc(sizeof(struct eventAction));
+        // Next action: Read from client
+        ea->callback = writeToClient;
+
+        // Prep for writing to client
+        ea->arg = state;
+        event.data.ptr = ea;
+        event.events = EPOLLOUT | EPOLLET; // use edge-triggered monitoring
+        if (epoll_ctl(efd, EPOLL_CTL_MOD, state->clientFd, &event) < 0) {
+            fprintf(stderr, "error adding event\n");
+            exit(1);
+        }
+    }
+
 
     if (numBytesRead < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
         // no more data to read()
         return 1;
 	}
-    else {
+    else if (numBytesRead == -1 && (errno != EWOULDBLOCK && errno != EAGAIN)) {
 		perror("error reading");
 		return 0;
 	}
-    return 0;
+    return 1;
 }
 
 int writeToClient(requestStateType* state) {
-    printf("WRITING TO CLIENT!");
-    return 0;
+    int numBytesWritten = -1;
+    do {
+        numBytesWritten = write(state->clientFd, (state->responseBuf + state->bytesSentToClient), state->bytesReadFromServer);
+        state->bytesSentToClient += numBytesWritten;
+    } while (numBytesWritten <= 0);
+
+    
+    if (numBytesWritten == -1 && (errno == EWOULDBLOCK || errno == EAGAIN)) {
+        // no more data to read()
+        return 1;
+	}
+    else if (numBytesWritten == -1 && (errno != EWOULDBLOCK && errno != EAGAIN)) {
+		perror("error reading");
+		return 0;
+	}
+    else {
+        closeFds(state->clientFd, state->serverFd);
+    }
+
+    return 1;
 }
 
 
@@ -555,25 +607,7 @@ int readRequest(char* clientRequest, char* proxyReq, char* host, char* port, cha
         strcat(proxyReq, acceptEncoding);
         strcat(proxyReq, connectionHeadr);
         strcat(proxyReq, proxyConnectionHeadr);
-
-
-        // Copy any other relavant headers
-        // while(Rio_readlineb(&rioClient, buf, MAXBUF) > 0) {
-        //     // End when you see '\r\n'
-        //     if (!strcmp(buf, END_HTTP)) {
-        //         strcat(request, END_HTTP);
-        //         break;
-        //     }
-        //     // Ignore these headers, we overwrote them
-        //     else if (strstr(buf, USER_AGENT_KEY) || strstr(buf, ACCEPT_KEY) || strstr(buf, ACCEPT_ENCODE_KEY)
-        //             || strstr(buf, PROXY_KEY) || strstr(buf, CONNECTION_KEY) || strstr(buf, COOKIE_KEY)
-        //             || strstr(buf, HOST_KEY)) {
-        //             continue;
-        //     }
-        //     else {
-        //         strcat(request, buf);
-        //     }
-        // }
+        strcat(proxyReq, END_HTTP);        
 
         // Add caching information here
         strcpy(cacheKey, host);
@@ -581,7 +615,6 @@ int readRequest(char* clientRequest, char* proxyReq, char* host, char* port, cha
         strcat(cacheKey, port);
         strcat(cacheKey, query);
 
-        // TODO Log it as well
         char* httpPrefix = "http://";
         char* logBuf = Malloc(sizeof(char) * (strlen(cacheKey) + strlen(httpPrefix) + strlen("\n")));
         strcpy(logBuf, httpPrefix);
@@ -590,6 +623,9 @@ int readRequest(char* clientRequest, char* proxyReq, char* host, char* port, cha
         strcat(logBuf, port);
         strcat(logBuf, query);
         strcat(logBuf, "\n");
+
+        logInfo(logBuf);
+
         return 0;
     }
 
@@ -798,8 +834,7 @@ void closeFds(int* clientFd, int* serverFd) {
     }
 }
 
-int openListenfd(char *port)
-{
+int openListenfd(char *port) {
     struct sockaddr_in ip4Addr;
     int listenfd;
 
